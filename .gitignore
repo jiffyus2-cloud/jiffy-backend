@@ -33,10 +33,10 @@ lerna-debug.log*
 .history
 
 # Environment variables
-.env
+#.env
 .env.test
 .env.production
-.env.local
+#.env.local
 
 # TypeScript
 /tsconfig.tsbuildinfo
