@@ -4,7 +4,8 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   app.enableCors(); // <-- ¡Esta línea es vital!
-  // Escucha en el puerto definido por Cloud Run o el 8080 por defecto
-  await app.listen(process.env.PORT || 8080);
+  
+  // El '0.0.0.0' es OBLIGATORIO para que Cloud Run pueda entrar al contenedor
+  await app.listen(process.env.PORT || 8080, '0.0.0.0');
 }
 bootstrap();
