@@ -7,7 +7,7 @@ export class StripeService {
 
   constructor() {
     this.stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-      apiVersion: '2025-02-11.acacia', // Best practice to use latest or a fixed version
+      apiVersion: '2026-02-25.clover', // Best practice to use latest or a fixed version
     });
   }
 
