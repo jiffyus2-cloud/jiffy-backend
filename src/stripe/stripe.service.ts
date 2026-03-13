@@ -31,6 +31,10 @@ export class StripeService {
       cancel_url: 'http://localhost:5173/checkout',
     });
 
-    return { sessionId: session.id };
+    // ¡Aquí está la magia! Devolvemos la URL al frontend
+    return { 
+      sessionId: session.id,
+      url: session.url 
+    };
   }
 }
