@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 import Stripe from 'stripe';
 
 @Injectable()
@@ -36,5 +36,40 @@ export class StripeService {
       sessionId: session.id,
       url: session.url 
     };
+  }
+
+  // --- NUEVA FUNCIÓN DE VERIFICACIÓN ---
+  async confirmPayment(sessionId: string, orderId: string) {
+    try {
+      // 1. Le pedimos a Stripe el recibo oficial de esta sesión
+      const session = await this.stripe.checkout.sessions.retrieve(sessionId);
+
+      // 2. Evaluamos el estado real del dinero
+      if (session.payment_status === 'paid') {
+        
+        // [NOTA ARQUITECTÓNICA FUTURA]
+        // Aquí es donde conectarías Firebase Admin SDK a tu Backend 
+        // para buscar el 'orderId' en Firestore y actualizar su status a 'paid'.
+        // Por ahora, le daremos luz verde al Frontend para que limpie el carrito.
+
+        return { 
+          success: true, 
+          message: 'Pago verificado exitosamente con Stripe',
+          orderId: orderId 
+        };
+      } else {
+        // Si el usuario canceló o la tarjeta falló
+        throw new HttpException(
+          'El pago aún no se ha procesado correctamente.', 
+          HttpStatus.PAYMENT_REQUIRED
+        );
+      }
+    } catch (error) {
+      console.error('Error validando con Stripe:', error);
+      throw new HttpException(
+        'Error interno al intentar verificar el pago.', 
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
   }
 }
