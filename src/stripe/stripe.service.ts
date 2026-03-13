@@ -12,6 +12,7 @@ export class StripeService {
   }
 
   async createCheckoutSession(orderDetails: { title: string; amount: number }) {
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
     const session = await this.stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
@@ -27,8 +28,8 @@ export class StripeService {
           quantity: 1,
         },
       ],
-      success_url: 'http://localhost:5173/success?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: 'http://localhost:5173/checkout',
+      success_url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/checkout`,
     });
 
     // ¡Aquí está la magia! Devolvemos la URL al frontend
