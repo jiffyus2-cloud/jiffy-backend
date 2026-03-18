@@ -7,27 +7,45 @@ export class StripeService {
   private stripe: Stripe;
 
   constructor() {
-    this.stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+    // 1. Soportamos la variable con prefijo VITE_ o normal
+    const stripeKey = process.env.STRIPE_SECRET_KEY || process.env.VITE_STRIPE_SECRET_KEY || 'sk_test_fallback';
+    
+    this.stripe = new Stripe(stripeKey, {
       apiVersion: '2026-02-25.clover',
     });
 
-    // Inicializamos Firebase Admin para poder editar la BD desde el backend
+    // Inicializamos Firebase Admin protegiéndolo de errores (Crash)
     if (!admin.apps.length) {
-      admin.initializeApp({
-        // Asegúrate de poner esto en tu .env del backend
-        credential: admin.credential.cert({
-          projectId: process.env.FIREBASE_PROJECT_ID,
-          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          // Reemplazamos los saltos de línea escapados si vienen en un string
-          privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-        }),
-      });
+      try {
+        // 2. Extraemos las variables soportando el formato VITE_ de tu entorno
+        const projectId = process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID;
+        const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || process.env.VITE_FIREBASE_CLIENT_EMAIL;
+        const privateKey = process.env.FIREBASE_PRIVATE_KEY || process.env.VITE_FIREBASE_PRIVATE_KEY;
+
+        // 3. Verificamos que ninguna esté vacía antes de pasarlas a Firebase
+        if (!projectId || !clientEmail || !privateKey) {
+          console.warn('⚠️ ADVERTENCIA: Faltan variables de Firebase. El servidor arrancará, pero el Webhook no podrá editar la BD.');
+        } else {
+          // 4. Si existen, inicializamos Firebase
+          admin.initializeApp({
+            credential: admin.credential.cert({
+              projectId: projectId,
+              clientEmail: clientEmail,
+              privateKey: privateKey.replace(/\\n/g, '\n'),
+            }),
+          });
+          console.log('✅ Firebase Admin inicializado correctamente.');
+        }
+      } catch (error: any) {
+        console.error('❌ CRÍTICO: Falló la configuración de Firebase Admin:', error.message);
+      }
     }
   }
 
   // Se añadió 'orderId' a los parámetros
   async createCheckoutSession(orderDetails: { title: string; amount: number; orderId: string }) {
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const frontendUrl = process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:5173';
+    
     const session = await this.stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
@@ -59,10 +77,11 @@ export class StripeService {
 
   // --- NUEVA FUNCIÓN QUE MANEJA EL WEBHOOK SEGURO DE STRIPE ---
   async handleStripeWebhook(signature: string, rawBody: Buffer) {
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || process.env.VITE_STRIPE_WEBHOOK_SECRET;
     let event: Stripe.Event;
 
     try {
+      if (!webhookSecret) throw new Error('No hay STRIPE_WEBHOOK_SECRET configurado.');
       // Verificamos matemáticamente que la firma coincida para evitar hackeos
       event = this.stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
     } catch (err: any) {
