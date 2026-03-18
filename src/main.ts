@@ -2,7 +2,8 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // En tu archivo main.ts
+  const app = await NestFactory.create(AppModule, { rawBody: true });
   
   // Configuración CORS a prueba de balas para Google Cloud
   app.enableCors({
