@@ -3,7 +3,6 @@ import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 @Injectable()
 export class AiService {
   async sortPhotos(photosData: any[]) {
-    // Soportamos el prefijo VITE_ por si usas el mismo nombre de variable que en el frontend
     const apiKey = process.env.VITE_1CLIC_API_KEY;
 
     if (!apiKey) {
@@ -18,7 +17,7 @@ export class AiService {
           'Authorization': `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
-          model_id: '53893e5c-cc14-4432-b98b-88e8782b2f8b', // <-- AQUÍ ESTÁ EL CAMBIO
+          model_id: '53893e5c-cc14-4432-b98b-88e8782b2f8b',
           action: 'sort_photos',
           photos: photosData,
         }),
