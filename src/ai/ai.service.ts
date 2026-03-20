@@ -18,7 +18,7 @@ export class AiService {
           'Authorization': `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
-          agentId: '53893e5c-cc14-4432-b98b-88e8782b2f8b',
+          model_id: '53893e5c-cc14-4432-b98b-88e8782b2f8b', // <-- AQUÍ ESTÁ EL CAMBIO
           action: 'sort_photos',
           photos: photosData,
         }),
