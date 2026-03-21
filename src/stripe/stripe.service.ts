@@ -52,16 +52,16 @@ export class StripeService {
       line_items: [
         {
           price_data: {
-            currency: 'usd',
+            currency: 'cop', // ✨ AQUÍ ESTÁ EL CAMBIO CLAVE A PESOS COLOMBIANOS
             product_data: {
               name: orderDetails.title,
             },
-            unit_amount: orderDetails.amount,
+            unit_amount: orderDetails.amount, // Stripe lee esto como COP netos
           },
           quantity: 1,
         },
       ],
-      // ✨ LA MAGIA: Guardamos el ID del pedido de forma invisible para que Stripe nos lo devuelva
+      // Guardamos el ID del pedido de forma invisible para que Stripe nos lo devuelva
       metadata: {
         orderId: orderDetails.orderId 
       },
