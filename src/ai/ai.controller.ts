@@ -6,8 +6,7 @@ export class AiController {
   constructor(private readonly aiService: AiService) {}
 
   @Post('sort-photos')
-  async sortPhotos(@Body() body: { photos: any[] }) {
-    // Recibimos las fotos del frontend y se las pasamos a nuestro servicio
-    return this.aiService.sortPhotos(body.photos);
+  async sortPhotos(@Body() body: { photos_data: any[], page_count?: number, layout_preferences?: any }) {
+    return this.aiService.sortPhotos(body.photos_data, body.page_count, body.layout_preferences);
   }
 }
