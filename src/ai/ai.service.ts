@@ -3,11 +3,10 @@ import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 @Injectable()
 export class AiService {
   async sortPhotos(photosData: any[], pageCount?: number, layoutPreferences?: any) {
-    // Asegúrate de que la variable de entorno coincida con la que tienes configurada
     const apiKey = process.env.ONECLIC_API_KEY || process.env.VITE_1CLIC_API_KEY;
 
     if (!apiKey) {
-      throw new HttpException('API Key de IA no configurada en el servidor', HttpStatus.INTERNAL_SERVER_ERROR);
+      throw new HttpException('API Key de IA no configurada', HttpStatus.INTERNAL_SERVER_ERROR);
     }
 
     try {
@@ -21,25 +20,40 @@ export class AiService {
           model_id: '53893e5c-cc14-4432-b98b-88e8782b2f8b',
           inputs: { 
             photos_data: photosData,
-            page_count: pageCount || 40, // Valor por defecto basado en tu UI
+            page_count: pageCount || 40,
             layout_preferences: layoutPreferences || {}
           },
         }),
       });
 
+      // 1. MANEJO SEGURO DE ERRORES HTTP (Evita crash si la API devuelve texto en vez de JSON)
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(`Error de la IA: ${errorData.error || response.statusText}`);
+        const errorText = await response.text();
+        let errorMessage = errorText;
+        try {
+          const errorJson = JSON.parse(errorText);
+          errorMessage = errorJson.error || errorJson.message || errorText;
+        } catch(e) {
+          // Si falla el parseo, mantenemos el errorText original
+        }
+        throw new Error(`Error de la API: ${errorMessage}`);
       }
 
       const result = await response.json();
 
-      // Parseamos la respuesta del agente limpiando el formato markdown
-      const output = JSON.parse(
-        result.output.replace(/```json|\n```|```/g, "").trim()
-      );
+      // 2. EXTRACCIÓN DEFENSIVA DEL JSON
+      let rawOutput = result.output || '';
+      
+      // Buscar el bloque que empiece con '{' y termine con '}' ignorando texto alrededor
+      const jsonMatch = rawOutput.match(/\{[\s\S]*\}/); 
+      
+      if (!jsonMatch) {
+         throw new Error(`La IA no devolvió un formato JSON válido. Respuesta: ${rawOutput.substring(0, 100)}...`);
+      }
 
-      // Devolvemos la estructura limpia al frontend
+      const cleanJsonString = jsonMatch[0];
+      const output = JSON.parse(cleanJsonString);
+
       return {
         success: true,
         ...output,
@@ -47,8 +61,12 @@ export class AiService {
       };
 
     } catch (error: any) {
-      console.error('Error en el servicio de IA:', error);
-      throw new HttpException('Error interno al procesar las imágenes con IA', HttpStatus.BAD_GATEWAY);
+      // Ahora el log mostrará el mensaje real en vez del error genérico de parseo
+      console.error('Error en el servicio de IA:', error.message || error);
+      throw new HttpException(
+        error.message || 'Error interno al procesar las imágenes', 
+        HttpStatus.BAD_GATEWAY
+      );
     }
   }
 }
