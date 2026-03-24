@@ -11,7 +11,7 @@ export class AiService {
 
     // El endpoint proporcionado en la documentación que pasaste.
     // Si sigue dando 404, deberás revisar el panel de 1clic.ai para confirmar la URL exacta.
-    const endpoint = 'https://app.1clic.ai/api/v1/run';
+    const endpoint = 'https://www.1clic.ai/api/v1/run';
 
     try {
       console.log(`Enviando petición a 1clic.ai (${endpoint})...`);
