@@ -9,8 +9,14 @@ export class AiService {
       throw new HttpException('API Key de IA no configurada', HttpStatus.INTERNAL_SERVER_ERROR);
     }
 
+    // El endpoint proporcionado en la documentación que pasaste.
+    // Si sigue dando 404, deberás revisar el panel de 1clic.ai para confirmar la URL exacta.
+    const endpoint = 'https://app.1clic.ai/api/v1/run';
+
     try {
-      const response = await fetch('https://app.1clic.ai/api/v1/run', {
+      console.log(`Enviando petición a 1clic.ai (${endpoint})...`);
+      
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -26,29 +32,38 @@ export class AiService {
         }),
       });
 
-      // 1. MANEJO SEGURO DE ERRORES HTTP (Evita crash si la API devuelve texto en vez de JSON)
+      // MANEJO MEJORADO DE ERRORES HTTP
       if (!response.ok) {
+        const statusCode = response.status;
         const errorText = await response.text();
         let errorMessage = errorText;
+        
         try {
           const errorJson = JSON.parse(errorText);
           errorMessage = errorJson.error || errorJson.message || errorText;
         } catch(e) {
-          // Si falla el parseo, mantenemos el errorText original
+          // Es un string plano o HTML (como el 404 que estamos viendo)
+          // Limpiamos etiquetas HTML si existen para un log más limpio
+          errorMessage = errorMessage.replace(/<[^>]*>?/gm, '').trim();
         }
-        throw new Error(`Error de la API: ${errorMessage}`);
+
+        console.error(`1clic.ai devolvió HTTP ${statusCode}:`, errorMessage);
+        
+        // Si es 404, lanzamos un error claro
+        if (statusCode === 404) {
+          throw new Error(`Endpoint de la IA no encontrado (HTTP 404). Verifica la URL: ${endpoint}`);
+        }
+
+        throw new Error(`Error de la API (HTTP ${statusCode}): ${errorMessage}`);
       }
 
       const result = await response.json();
 
-      // 2. EXTRACCIÓN DEFENSIVA DEL JSON
       let rawOutput = result.output || '';
-      
-      // Buscar el bloque que empiece con '{' y termine con '}' ignorando texto alrededor
       const jsonMatch = rawOutput.match(/\{[\s\S]*\}/); 
       
       if (!jsonMatch) {
-         throw new Error(`La IA no devolvió un formato JSON válido. Respuesta: ${rawOutput.substring(0, 100)}...`);
+         throw new Error(`La IA no devolvió JSON válido. Output crudo: ${rawOutput.substring(0, 50)}...`);
       }
 
       const cleanJsonString = jsonMatch[0];
@@ -61,10 +76,9 @@ export class AiService {
       };
 
     } catch (error: any) {
-      // Ahora el log mostrará el mensaje real en vez del error genérico de parseo
-      console.error('Error en el servicio de IA:', error.message || error);
+      console.error('Error procesando IA:', error.message || error);
       throw new HttpException(
-        error.message || 'Error interno al procesar las imágenes', 
+        error.message || 'Error interno al comunicarse con el proveedor de IA', 
         HttpStatus.BAD_GATEWAY
       );
     }
