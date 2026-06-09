@@ -3,7 +3,7 @@ import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 @Injectable()
 export class AiService {
   async sortPhotos(photosData: any[], pageCount?: number, layoutPreferences?: any) {
-    const apiKey = process.env.ONECLIC_API_KEY;
+    const apiKey = process.env.ONECLIC_API_KEY || process.env.VITE_1CLIC_API_KEY;
 
     if (!apiKey) {
       throw new HttpException('API Key de IA no configurada', HttpStatus.INTERNAL_SERVER_ERROR);
