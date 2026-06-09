@@ -116,12 +116,4 @@ export class StripeService {
     return { received: true };
   }
 
-  // Mantenemos esta función para que el Frontend no rompa si llama al endpoint viejo
-  async confirmPayment(sessionId: string, orderId: string) {
-    return { 
-      success: true, 
-      message: 'Pago delegado al Webhook exitosamente',
-      orderId: orderId 
-    };
-  }
 }
