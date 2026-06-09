@@ -49,7 +49,10 @@ export class AiService {
 
         console.error(`1clic.ai devolvió HTTP ${statusCode}:`, errorMessage);
         
-        // Si es 404, lanzamos un error claro
+        if (statusCode === 402) {
+          throw new Error('AI_INSUFFICIENT_BALANCE');
+        }
+
         if (statusCode === 404) {
           throw new Error(`Endpoint de la IA no encontrado (HTTP 404). Verifica la URL: ${endpoint}`);
         }
