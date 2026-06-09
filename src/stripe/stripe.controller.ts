@@ -1,20 +1,16 @@
-import { Controller, Post, Body, Headers, Req, HttpCode, HttpStatus, RawBodyRequest } from '@nestjs/common';
+import { Controller, Post, Body, Headers, Req, HttpCode, HttpStatus, RawBodyRequest, UseGuards } from '@nestjs/common';
 import { StripeService } from './stripe.service';
 import { Request } from 'express';
+import { FirebaseAuthGuard } from '../middleware/firebase-auth.guard';
 
 @Controller('stripe')
 export class StripeController {
   constructor(private readonly stripeService: StripeService) {}
 
   @Post('create-checkout')
+  @UseGuards(FirebaseAuthGuard)
   async createCheckout(@Body() orderDetails: { title: string; amount: number; orderId: string }) {
     return this.stripeService.createCheckoutSession(orderDetails);
-  }
-
-  // Mantenemos esto por compatibilidad con Success.tsx
-  @Post('confirm-payment')
-  async confirmPayment(@Body() body: { sessionId: string; orderId: string }) {
-    return this.stripeService.confirmPayment(body.sessionId, body.orderId);
   }
 
   // --- NUEVO ENDPOINT PARA EL WEBHOOK ---
