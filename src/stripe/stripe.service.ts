@@ -1,81 +1,141 @@
 import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 import Stripe from 'stripe';
-import * as admin from 'firebase-admin';
+import { getFirestore } from '../firebase/firebase-admin';
+
+/**
+ * Estados en los que un pedido NO se puede volver a cobrar.
+ *
+ * Se usa lista negra y no lista blanca a propósito: si mañana aparece un estado
+ * nuevo preferimos permitir el cobro (y detectarlo) antes que romper el checkout
+ * de un cliente por un estado que no habíamos previsto.
+ */
+const NON_PAYABLE_STATUSES = new Set([
+  'paid',
+  'mock_paid',
+  'en_produccion',
+  'enviado',
+  'entregado',
+]);
 
 @Injectable()
 export class StripeService {
   private stripe: Stripe;
 
   constructor() {
-    // 1. Soportamos la variable con prefijo VITE_ o normal
-    const stripeKey = process.env.STRIPE_SECRET_KEY || process.env.VITE_STRIPE_SECRET_KEY || 'sk_test_fallback';
-    
+    const stripeKey = process.env.STRIPE_SECRET_KEY || process.env.VITE_STRIPE_SECRET_KEY;
+
+    // Antes había un fallback a 'sk_test_fallback': el servicio arrancaba con una
+    // clave inválida y el fallo aparecía en el primer intento de pago, como un
+    // error opaco de Stripe. Mejor no arrancar.
+    if (!stripeKey) {
+      throw new Error(
+        'Falta STRIPE_SECRET_KEY (o VITE_STRIPE_SECRET_KEY). El servidor no puede procesar pagos.'
+      );
+    }
+
     this.stripe = new Stripe(stripeKey, {
       apiVersion: '2026-02-25.clover',
     });
 
-    // Inicializamos Firebase Admin protegiéndolo de errores (Crash)
-    if (!admin.apps.length) {
-      try {
-        // 2. Extraemos las variables soportando el formato VITE_ de tu entorno
-        const projectId = process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID;
-        const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || process.env.VITE_FIREBASE_CLIENT_EMAIL;
-        const privateKey = process.env.FIREBASE_PRIVATE_KEY || process.env.VITE_FIREBASE_PRIVATE_KEY;
-
-        // 3. Verificamos que ninguna esté vacía antes de pasarlas a Firebase
-        if (!projectId || !clientEmail || !privateKey) {
-          console.warn('⚠️ ADVERTENCIA: Faltan variables de Firebase. El servidor arrancará, pero el Webhook no podrá editar la BD.');
-        } else {
-          // 4. Si existen, inicializamos Firebase
-          admin.initializeApp({
-            credential: admin.credential.cert({
-              projectId: projectId,
-              clientEmail: clientEmail,
-              privateKey: privateKey.replace(/\\n/g, '\n'),
-            }),
-          });
-          console.log('✅ Firebase Admin inicializado correctamente.');
-        }
-      } catch (error: any) {
-        console.error('❌ CRÍTICO: Falló la configuración de Firebase Admin:', error.message);
-      }
-    }
+    // La inicialización de Firebase Admin se movió a src/firebase/firebase-admin.ts
+    // y ocurre en el arranque (main.ts). Antes vivía aquí y, si faltaban las
+    // credenciales, solo avisaba por consola: el servicio quedaba en pie pero
+    // incapaz de verificar tokens ni de leer pedidos.
   }
 
-  // Se añadió 'orderId' a los parámetros
-  async createCheckoutSession(orderDetails: { title: string; amount: number; orderId: string }) {
+  /**
+   * Crea la sesión de pago de un pedido.
+   *
+   * El importe se lee del pedido en Firestore y NO del cuerpo de la petición.
+   * Antes se pasaba `orderDetails.amount` directamente a Stripe como
+   * `unit_amount`, así que bastaba un POST con `amount: 100` para pagar 1 COP
+   * por un álbum de 280.000.
+   *
+   * `uid` viene de FirebaseAuthGuard, que ya validó el ID token.
+   */
+  async createCheckoutSession(params: {
+    orderId: string;
+    uid: string;
+    /** Importe que dice el cliente. Solo se usa para detectar discrepancias. */
+    clientAmount?: number;
+    /** Título que dice el cliente. Solo se usa como último recurso. */
+    clientTitle?: string;
+  }) {
+    const { orderId, uid, clientAmount, clientTitle } = params;
+
+    if (typeof orderId !== 'string' || orderId.trim() === '') {
+      throw new HttpException('Falta orderId', HttpStatus.BAD_REQUEST);
+    }
+
+    const snapshot = await getFirestore().collection('orders').doc(orderId).get();
+    if (!snapshot.exists) {
+      throw new HttpException('El pedido no existe', HttpStatus.NOT_FOUND);
+    }
+
+    const order = snapshot.data() as any;
+
+    // Solo puedes pagar tus propios pedidos.
+    if (order.userId !== uid) {
+      console.warn(`[stripe] Usuario ${uid} intentó pagar el pedido ${orderId} de ${order.userId}.`);
+      throw new HttpException('El pedido no te pertenece', HttpStatus.FORBIDDEN);
+    }
+
+    if (NON_PAYABLE_STATUSES.has(order.status)) {
+      throw new HttpException(
+        `El pedido ya está en estado "${order.status}" y no admite un nuevo pago`,
+        HttpStatus.CONFLICT
+      );
+    }
+
+    const total = Number(order.total);
+    if (!Number.isFinite(total) || total <= 0) {
+      throw new HttpException(
+        'El pedido no tiene un total válido. Vuelve al checkout y confirma la dirección.',
+        HttpStatus.BAD_REQUEST
+      );
+    }
+
+    // COP se cobra en unidades menores, igual que venía haciendo el frontend.
+    const unitAmount = Math.round(total * 100);
+
+    if (typeof clientAmount === 'number' && clientAmount !== unitAmount) {
+      // No es motivo de rechazo (el cliente puede ir un paso por detrás), pero
+      // una discrepancia sistemática es señal de manipulación.
+      console.warn(
+        `[stripe] Importe distinto en el pedido ${orderId}: cliente=${clientAmount}, ` +
+        `servidor=${unitAmount}. Se usa el del servidor.`
+      );
+    }
+
+    const title = order.product?.name || clientTitle || 'Pedido Jiffy';
     const frontendUrl = process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:5173';
-    
+
     const session = await this.stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
       line_items: [
         {
           price_data: {
-            currency: 'cop', // ✨ AQUÍ ESTÁ EL CAMBIO CLAVE A PESOS COLOMBIANOS
-            product_data: {
-              name: orderDetails.title,
-            },
-            unit_amount: orderDetails.amount, // Stripe lee esto como COP netos
+            currency: 'cop',
+            product_data: { name: title },
+            unit_amount: unitAmount,
           },
           quantity: 1,
         },
       ],
-      // Guardamos el ID del pedido de forma invisible para que Stripe nos lo devuelva
-      metadata: {
-        orderId: orderDetails.orderId 
-      },
+      // Guardamos el ID del pedido de forma invisible para recuperarlo en el webhook.
+      metadata: { orderId },
       success_url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${frontendUrl}/checkout`,
     });
 
-    return { 
+    return {
       sessionId: session.id,
-      url: session.url 
+      url: session.url,
     };
   }
 
-  // --- NUEVA FUNCIÓN QUE MANEJA EL WEBHOOK SEGURO DE STRIPE ---
+  // --- WEBHOOK SEGURO DE STRIPE ---
   async handleStripeWebhook(signature: string, rawBody: Buffer) {
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || process.env.VITE_STRIPE_WEBHOOK_SECRET;
     let event: Stripe.Event;
@@ -92,19 +152,18 @@ export class StripeService {
     // Si el usuario pagó exitosamente
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session;
-      
+
       // Recuperamos el ID oculto del pedido
       const orderId = session.metadata?.orderId;
 
       if (orderId) {
         try {
           // Actualizamos la base de datos DIRECTAMENTE desde el servidor
-          const db = admin.firestore();
-          await db.collection('orders').doc(orderId).update({
+          await getFirestore().collection('orders').doc(orderId).update({
             status: 'paid',
-            updatedAt: new Date().toISOString()
+            updatedAt: new Date().toISOString(),
           });
-          
+
           console.log(`✅ ¡Éxito! Pedido ${orderId} actualizado a 'paid' vía Webhook.`);
         } catch (dbError) {
           console.error(`❌ Error actualizando Firebase para el pedido ${orderId}:`, dbError);
@@ -115,5 +174,4 @@ export class StripeService {
     // Le decimos a Stripe que recibimos la notificación
     return { received: true };
   }
-
 }
