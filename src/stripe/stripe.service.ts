@@ -1,6 +1,7 @@
 import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 import Stripe from 'stripe';
 import { getFirestore } from '../firebase/firebase-admin';
+import { DiscountsService } from '../discounts/discounts.service';
 
 /**
  * Estados en los que un pedido NO se puede volver a cobrar.
@@ -21,7 +22,7 @@ const NON_PAYABLE_STATUSES = new Set([
 export class StripeService {
   private stripe: Stripe;
 
-  constructor() {
+  constructor(private readonly discountsService: DiscountsService) {
     const stripeKey = process.env.STRIPE_SECRET_KEY || process.env.VITE_STRIPE_SECRET_KEY;
 
     // Antes había un fallback a 'sk_test_fallback': el servicio arrancaba con una
@@ -158,13 +159,35 @@ export class StripeService {
 
       if (orderId) {
         try {
+          const orderRef = getFirestore().collection('orders').doc(orderId);
+          const orderSnapshot = await orderRef.get();
+
           // Actualizamos la base de datos DIRECTAMENTE desde el servidor
-          await getFirestore().collection('orders').doc(orderId).update({
+          await orderRef.update({
             status: 'paid',
             updatedAt: new Date().toISOString(),
           });
 
           console.log(`✅ ¡Éxito! Pedido ${orderId} actualizado a 'paid' vía Webhook.`);
+
+          // El canje del código se cuenta AQUÍ, no cuando el cliente lo escribe:
+          // así un código no se gasta por abandonar el checkout y nadie puede
+          // agotar el código de otro escribiéndolo. redeem() es idempotente por
+          // pedido, porque Stripe reintenta sus webhooks.
+          const order = orderSnapshot.data() as any;
+          if (order?.discountCode) {
+            const result = await this.discountsService.redeem(
+              order.discountCode,
+              order.userId || null,
+              orderId
+            );
+            if (result.overLimit) {
+              console.warn(
+                `⚠️ El pedido ${orderId} usó ${order.discountCode} por encima de sus límites; ` +
+                'el canje queda marcado para revisarlo.'
+              );
+            }
+          }
         } catch (dbError) {
           console.error(`❌ Error actualizando Firebase para el pedido ${orderId}:`, dbError);
         }
