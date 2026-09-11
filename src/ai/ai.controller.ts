@@ -1,16 +1,12 @@
-import { Controller, Post, Body, UseGuards } from '@nestjs/common';
+import { Controller, Post, Body } from '@nestjs/common';
 import { AiService } from './ai.service';
-import { FirebaseAuthGuard } from '../middleware/firebase-auth.guard';
 
+// `POST /ai/sort-photos` vivió aquí hasta 2026-09: ordenaba las fotos del álbum
+// con un modelo de 1clic.ai. El frontend ya ordena en local (orden de selección
+// del carrete, con el nombre de archivo como respaldo), así que se retiró.
 @Controller('ai')
 export class AiController {
   constructor(private readonly aiService: AiService) {}
-
-  @Post('sort-photos')
-  @UseGuards(FirebaseAuthGuard)
-  async sortPhotos(@Body() body: { photos_data: any[], page_count?: number, layout_preferences?: any }) {
-    return this.aiService.sortPhotos(body.photos_data, body.page_count, body.layout_preferences);
-  }
 
   @Post('support-chat')
   async supportChat(@Body() body: { message: string, conversation_history?: { role: string, content: string }[] }) {
