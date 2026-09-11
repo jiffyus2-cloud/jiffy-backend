@@ -13,7 +13,6 @@ Firestore y Storage. Este servicio solo interviene en el pago y en la IA.
 | `GET` | `/` | — | Comprobación de vida |
 | `POST` | `/stripe/create-checkout` | ID token de Firebase | Crea la sesión de pago de un pedido |
 | `POST` | `/stripe/webhook` | Firma de Stripe | Marca el pedido como `paid` |
-| `POST` | `/ai/sort-photos` | — | Ordena fotos con IA |
 | `POST` | `/ai/support-chat` | — | Chat de soporte |
 
 `create-checkout` recibe un `orderId` y toma el importe del pedido en Firestore.
