@@ -3,7 +3,8 @@
   "version": "0.0.1",
   "scripts": {
     "build": "nest build",
-    "start": "node dist/main"
+    "start": "node dist/main",
+    "test": "nest build && node --test dist/oneclic/oneclic.client.test.js"
   },
   "dependencies": {
     "@nestjs/common": "^10.0.0",
