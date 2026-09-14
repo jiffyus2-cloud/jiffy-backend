@@ -89,7 +89,12 @@ export class OneclicService {
   private readonly client: OneclicClient;
 
   constructor() {
-    this.client = new OneclicClient(readOneclicConfig());
+    this.client = this.createClient();
+  }
+
+  /** Punto de sustitución para los tests (sin parámetros en el constructor: Nest no tiene que inyectar nada). */
+  protected createClient(): OneclicClient {
+    return new OneclicClient(readOneclicConfig());
   }
 
   /**
@@ -98,6 +103,15 @@ export class OneclicService {
    */
   static externalUserId(uid: string): string {
     return createHash('sha256').update(`jiffyphotos:${uid}`).digest('hex').slice(0, 64);
+  }
+
+  /**
+   * Huella corta de lo que se pide, para la Idempotency-Key: dos peticiones
+   * sobre el mismo registro el mismo día solo se consideran repetidas si
+   * piden lo mismo, al mismo agente, en el mismo modo.
+   */
+  static requestFingerprint(agentId: string, mode: string, message: string): string {
+    return createHash('sha256').update([agentId, mode, message].join('\n')).digest('hex').slice(0, 12);
   }
 
   // ── Estado para el panel del dueño ─────────────────────────────────────
@@ -140,7 +154,9 @@ export class OneclicService {
     if (!request.recordId) throw new BadRequestException('Falta el registro al que se aplica la propuesta.');
 
     const agent = await this.resolveAgent(request.agentId);
-    const mode = agent.id === ONECLIC_TEST_AGENT_ID ? 'dry_run' : request.mode === 'dry_run' ? 'dry_run' : 'default';
+    // Un run real gasta de la cartera: solo si se pide 'default' con todas
+    // las letras. Un modo ausente o mal escrito se queda en seco.
+    const mode = agent.id !== ONECLIC_TEST_AGENT_ID && request.mode === 'default' ? 'default' : 'dry_run';
 
     const context = trimContext(request.context);
 
@@ -155,10 +171,18 @@ export class OneclicService {
           response_schema: PROPOSAL_RESPONSE_SCHEMA as unknown as Record<string, unknown>,
           mode,
         },
-        buildIdempotencyKey(request.recordId),
+        buildIdempotencyKey(request.recordId, new Date(), OneclicService.requestFingerprint(agent.id, mode, message)),
       );
     } catch (error) {
       throw this.toHttp(error);
+    }
+
+    if (result.status === 'error' || (result.reply == null && result.error)) {
+      // Un run que acabó mal no es una propuesta vacía: se dice qué pasó.
+      throw new HttpException(
+        { code: 'run_failed', message: result.error || 'El agente no devolvió respuesta.', run_id: result.run_id ?? null, cost_usd: result.cost_usd ?? 0 },
+        502,
+      );
     }
 
     return OneclicService.toProposal(result, agent);
@@ -267,17 +291,17 @@ export class OneclicService {
       const result = await this.client.run(
         ONECLIC_TEST_AGENT_ID,
         runBody(`Tarea sintética ${open.ref}: propón un resumen de un pedido de ejemplo.`),
-        buildIdempotencyKey(`${open.ref}-sync`),
+        buildIdempotencyKey(open.session_id, new Date(), 'sync'),
       );
       return `run ${result.run_id ?? 'n/d'} · typed=${result.typed_response?.valid ?? 'n/d'} · $${result.cost_usd ?? 0} · ${result.duration_ms ?? '?'} ms`;
     });
 
     await record('run_sync_replay', async () => {
-      // Misma Idempotency-Key en la misma fecha: debe volver el mismo run.
+      // Misma Idempotency-Key (sesión + fecha + 'sync'): debe volver el mismo run.
       const result = await this.client.run(
         ONECLIC_TEST_AGENT_ID,
         runBody(`Tarea sintética ${open.ref}: propón un resumen de un pedido de ejemplo.`),
-        buildIdempotencyKey(`${open.ref}-sync`),
+        buildIdempotencyKey(open.session_id, new Date(), 'sync'),
       );
       return `run ${result.run_id ?? 'n/d'} · deduplicated=${Boolean(result.deduplicated)}`;
     });
@@ -286,7 +310,7 @@ export class OneclicService {
       const result = await this.client.run(
         ONECLIC_TEST_AGENT_ID,
         { ...runBody(`Tarea sintética ${open.ref} (asíncrona).`), async: true },
-        buildIdempotencyKey(`${open.ref}-async`),
+        buildIdempotencyKey(open.session_id, new Date(), 'async'),
       );
       return `run ${result.run_id ?? 'n/d'} · status=${result.status ?? 'n/d'}`;
     });

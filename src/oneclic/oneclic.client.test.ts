@@ -9,6 +9,7 @@ import {
   parseRetryAfter,
   pollDelayMs,
 } from './oneclic.client';
+import { HttpException } from '@nestjs/common';
 import { OneclicService, parseTypedReply } from './oneclic.service';
 
 // Se ejecutan sobre el JS compilado (ver el script `test` de package.json).
@@ -49,9 +50,19 @@ function fakeSleep() {
 }
 
 describe('reglas puras', () => {
-  it('Idempotency-Key = <record>-<fecha>', () => {
+  it('Idempotency-Key = <record>-<fecha>[-<discriminador>]', () => {
     assert.equal(buildIdempotencyKey('order_42', new Date('2026-09-14T23:59:00Z')), 'order_42-2026-09-14');
     assert.equal(buildIdempotencyKey('a/b c', new Date('2026-01-02T00:00:00Z')), 'a_b_c-2026-01-02');
+    assert.equal(buildIdempotencyKey('order_42', new Date('2026-09-14T00:00:00Z'), 'abc123'), 'order_42-2026-09-14-abc123');
+  });
+
+  it('la huella distingue mensaje, agente y modo sobre el mismo registro', () => {
+    const base = OneclicService.requestFingerprint('agent-1', 'dry_run', 'hola');
+    assert.match(base, /^[0-9a-f]{12}$/);
+    assert.equal(base, OneclicService.requestFingerprint('agent-1', 'dry_run', 'hola'));
+    assert.notEqual(base, OneclicService.requestFingerprint('agent-1', 'dry_run', 'adiós'));
+    assert.notEqual(base, OneclicService.requestFingerprint('agent-2', 'dry_run', 'hola'));
+    assert.notEqual(base, OneclicService.requestFingerprint('agent-1', 'default', 'hola'));
   });
 
   it('cadencia de sondeo 2s → 5s → 10s, y Retry-After manda si es mayor', () => {
@@ -210,6 +221,53 @@ describe('OneclicClient', () => {
     await assert.rejects(
       client.run('nobody', { external_user_id: 'u', message: 'm' }, 'k'),
       (e: OneclicApiError) => e.code === 'agent_not_allowed' && e.remediation === 'contact_owner' && e.remediationEndpoint === 'GET /api/v1/agents',
+    );
+  });
+});
+
+// ── Servicio: propose() con un cliente falso ─────────────────────────────────
+
+function serviceWith(responses: Response[]) {
+  const { impl, calls } = fakeFetch(responses);
+  class TestService extends OneclicService {
+    protected createClient() { return new OneclicClient(CONFIG, impl, fakeSleep().impl); }
+  }
+  return { service: new TestService(), calls };
+}
+
+const AGENTS = { agents: [{ id: 'agent-x', address: 'agent:x', name: 'X', description: null, status: 'active', modes: ['default'], runnable: true }] };
+const OK_RUN = { run_id: 'r1', status: 'success', reply: '{"summary":"s","proposal":"p"}', cost_usd: 0, duration_ms: 3 };
+
+describe('OneclicService.propose', () => {
+  it('sin mode explícito "default", un agente asignado corre en seco', async () => {
+    const { service, calls } = serviceWith([jsonResponse(200, AGENTS), jsonResponse(200, OK_RUN)]);
+    await service.propose({ uid: 'u', agentId: 'agent-x', message: 'hola', recordId: 'ORD-1' });
+    assert.equal(JSON.parse(calls[1].init!.body as string).mode, 'dry_run');
+
+    const real = serviceWith([jsonResponse(200, AGENTS), jsonResponse(200, OK_RUN)]);
+    await real.service.propose({ uid: 'u', agentId: 'agent-x', message: 'hola', recordId: 'ORD-1', mode: 'default' });
+    assert.equal(JSON.parse(real.calls[1].init!.body as string).mode, 'default');
+  });
+
+  it('la Idempotency-Key cambia si cambia el mensaje sobre el mismo registro', async () => {
+    const a = serviceWith([jsonResponse(200, OK_RUN)]);
+    await a.service.propose({ uid: 'u', agentId: '1clic-test', message: 'mensaje de envío', recordId: 'ORD-1' });
+    const b = serviceWith([jsonResponse(200, OK_RUN)]);
+    await b.service.propose({ uid: 'u', agentId: '1clic-test', message: 'respuesta a la queja', recordId: 'ORD-1' });
+    const keyA = (a.calls[0].init!.headers as Record<string, string>)['Idempotency-Key'];
+    const keyB = (b.calls[0].init!.headers as Record<string, string>)['Idempotency-Key'];
+    assert.match(keyA, /^ORD-1-\d{4}-\d{2}-\d{2}-[0-9a-f]{12}$/);
+    assert.notEqual(keyA, keyB);
+  });
+
+  it('un run que acaba en error no es una propuesta vacía: 502 run_failed', async () => {
+    const { service } = serviceWith([
+      jsonResponse(202, { run_id: 'r9', status: 'queued' }),
+      jsonResponse(200, { run_id: 'r9', status: 'error', error: 'model timed out', reply: null, cost_usd: 0.03, duration_ms: 900 }),
+    ]);
+    await assert.rejects(
+      service.propose({ uid: 'u', agentId: '1clic-test', message: 'hola', recordId: 'ORD-1' }),
+      (e: HttpException) => e.getStatus() === 502 && (e.getResponse() as any).code === 'run_failed' && (e.getResponse() as any).message === 'model timed out',
     );
   });
 });

@@ -248,12 +248,16 @@ export function pollDelayMs(attempt: number, retryAfterSeconds?: number | null):
 }
 
 /**
- * `Idempotency-Key: <record_id>-<attempt_date>`. La misma clave dentro de 24 h
- * devuelve el mismo run, así que un doble clic no cobra dos veces.
+ * `Idempotency-Key: <record_id>-<attempt_date>[-<discriminator>]`. La misma
+ * clave dentro de 24 h devuelve el mismo run, así que un doble clic no cobra
+ * dos veces. El discriminador distingue peticiones DISTINTAS sobre el mismo
+ * registro el mismo día (otro mensaje, otro agente, otro modo): sin él, la
+ * segunda recibiría la respuesta de la primera.
  */
-export function buildIdempotencyKey(recordId: string, attemptDate: Date = new Date()): string {
+export function buildIdempotencyKey(recordId: string, attemptDate: Date = new Date(), discriminator?: string): string {
   const safeRecord = String(recordId).replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 100);
-  return `${safeRecord}-${attemptDate.toISOString().slice(0, 10)}`;
+  const suffix = discriminator ? `-${discriminator.replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 40)}` : '';
+  return `${safeRecord}-${attemptDate.toISOString().slice(0, 10)}${suffix}`;
 }
 
 /** Tope de espera para no dejar colgada una petición HTTP del navegador. */
