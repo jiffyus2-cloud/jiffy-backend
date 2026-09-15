@@ -2,7 +2,8 @@
 #
 # Canjea un código de configuración de 1clic.ai e instala la clave en Cloud Run.
 #
-# Pensado para Cloud Shell (tiene gcloud, curl y jq). Cubre los pasos A, B y C
+# Corre en Cloud Shell o en Git Bash de Windows con el Cloud SDK instalado
+# (tiene que haber gcloud, curl y node). Cubre los pasos A, B y C
 # del bloque de conexión y la rotación a los 90 días, que es el mismo camino:
 #
 #   A. avisa a 1clic de que un agente llegó (sin clave)
@@ -20,7 +21,7 @@
 #   ONECLIC_CONNECTION_ID  1767800c-c10e-491d-8ee7-19dc0a24aae7
 #   SERVICE                jiffy-backend
 #   REGION                 europe-west1
-#   PROJECT                jiffy-photos-app
+#   PROJECT                project-d2f55c96-6c64-431f-b40   (el de Cloud Run, NO el de Firebase)
 #   REPO                   jiffyus2-cloud/jiffy-backend   (origen que se ata a la clave)
 #   HOST                   jiffyphotos.com
 
@@ -35,15 +36,30 @@ fi
 ONECLIC_CONNECTION_ID="${ONECLIC_CONNECTION_ID:-1767800c-c10e-491d-8ee7-19dc0a24aae7}"
 SERVICE="${SERVICE:-jiffy-backend}"
 REGION="${REGION:-europe-west1}"
-PROJECT="${PROJECT:-jiffy-photos-app}"
+PROJECT="${PROJECT:-project-d2f55c96-6c64-431f-b40}"
 REPO="${REPO:-jiffyus2-cloud/jiffy-backend}"
 HOST="${HOST:-jiffyphotos.com}"
 API="https://www.1clic.ai/api/v1"
 EVENTS="$API/connections/$ONECLIC_CONNECTION_ID/events"
 
-for tool in curl jq gcloud; do
+# En Git Bash (Windows) el wrapper gcloud.cmd rompe con argumentos con espacios;
+# si está el Python empaquetado del SDK se llama a lib/gcloud.py directamente.
+if ! command -v gcloud >/dev/null; then
+  for sdk in "${CLOUDSDK_ROOT_DIR:-}" "${LOCALAPPDATA:-}/Google/Cloud SDK/google-cloud-sdk" "/c/Program Files (x86)/Google/Cloud SDK/google-cloud-sdk"; do
+    if [[ -n "$sdk" && -f "$sdk/lib/gcloud.py" && -f "$sdk/platform/bundledpython/python.exe" ]]; then
+      SDK_ROOT="$sdk"
+      gcloud() { "$SDK_ROOT/platform/bundledpython/python.exe" "$SDK_ROOT/lib/gcloud.py" "$@"; }
+      break
+    fi
+  done
+fi
+
+for tool in curl node gcloud; do
   command -v "$tool" >/dev/null || { echo "Falta $tool" >&2; exit 2; }
 done
+
+# JSON con node (está en Cloud Shell y en cualquier máquina con este repo); así no dependemos de jq.
+json_get() { node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const v=process.argv[1].split(".").reduce((o,k)=>o?.[k],JSON.parse(s));process.stdout.write(v==null?"":String(v))}catch{}})' "$1"; }
 
 # ── A. Anunciarse (sin clave) ────────────────────────────────────────────────
 echo "A. Avisando a 1clic (agent_connected)…"
@@ -55,20 +71,22 @@ echo "   HTTP $code"
 echo "B. Canjeando el código de configuración…"
 provision=$(curl -sS -w '\n%{http_code}' -X POST "$API/keys/provision" \
   -H 'Content-Type: application/json' \
-  -d "$(jq -cn --arg code "$SETUP_CODE" --arg repo "$REPO" --arg host "$HOST" \
-        '{setup_code:$code, origin:{repo:$repo, host:$host, agent:"Claude Code (Opus 5) via Cloud Shell"}}')")
+  -d "$(node -e 'process.stdout.write(JSON.stringify({setup_code:process.argv[1],origin:{repo:process.argv[2],host:process.argv[3],agent:"Claude Code (Opus 5)"}}))' "$SETUP_CODE" "$REPO" "$HOST")")
 code=${provision##*$'\n'}
 body=${provision%$'\n'*}
 
 if [[ "$code" != "200" ]]; then
-  echo "   1clic respondió HTTP $code:" >&2
-  echo "$body" | jq -r '.error | "   \(.code): \(.message)"' >&2 || echo "$body" >&2
+  echo "   1clic respondió HTTP $code: $(printf '%s' "$body" | json_get error.code) — $(printf '%s' "$body" | json_get error.message)" >&2
   exit 1
 fi
 
-KEY=$(echo "$body" | jq -r '.key')
+KEY=$(printf '%s' "$body" | json_get key)
+ROTATED=$(printf '%s' "$body" | json_get rotated)
+MISMATCH=$(printf '%s' "$body" | json_get scope.repo_mismatch)
 unset body provision
-[[ -n "$KEY" && "$KEY" != "null" ]] || { echo "   La respuesta no trae clave." >&2; exit 1; }
+[[ -n "$KEY" ]] || { echo "   La respuesta no trae clave." >&2; exit 1; }
+[[ "$ROTATED" == "true" ]] && echo "   (rotación: la clave anterior sigue valiendo 24 h)"
+[[ "$MISMATCH" == "true" ]] && echo "   AVISO: el repo declarado no coincide con el que el dueño escribió en 1clic." >&2
 
 # Todo lo que se imprime de aquí es metadato, nunca la clave.
 echo "   Clave recibida (prefijo $(printf '%s' "$KEY" | cut -c1-8)…)."
@@ -89,5 +107,5 @@ echo "   HTTP $code"
 
 unset KEY
 echo
-echo "Listo. Siguiente paso (D): entra en jiffyphotos.com → Dashboard → Conexiones → 'Verificar ahora'."
+echo "Listo. Siguiente paso (D): entra en https://jiffyphotos.com/lab/1clic con la cuenta de administración → Verificar ahora."
 echo "Si el panel dice 'agent_not_allowed', no es un fallo: asigna un agente a la conexión en 1clic."
