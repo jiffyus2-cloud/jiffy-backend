@@ -75,6 +75,8 @@ export interface StorageStats {
     bytes: number;
     cutoff: string;
     retentionDays: number;
+    /** null = caducidad no activada: no vence ningún borrador. */
+    appliesFrom: string | null;
   };
   topProjects: ProjectUsage[];
   topUsers: UserUsage[];
@@ -95,6 +97,7 @@ export interface CleanupSummary {
   trigger: string;
   retentionDays: number;
   cutoff: string;
+  appliesFrom: string | null;
   expiredDrafts: { count: number; bytes: number };
   orphans: { count: number; bytes: number };
   errors: string[];
@@ -260,6 +263,7 @@ export class StorageService {
     const orphanList: ProjectUsage[] = [];
 
     const cutoffMs = now - policy.draftRetentionDays * 24 * 60 * 60 * 1000;
+    const appliesFromMs = Date.parse(policy.retentionAppliesFrom ?? '');
     const expired = { count: 0, bytes: 0 };
 
     const byUser = new Map<string, UserUsage>();
@@ -277,7 +281,7 @@ export class StorageService {
         drafts.bytes += project.bytes;
         drafts.files += project.files;
         drafts.count += 1;
-        if (isExpired(project, cutoffMs)) {
+        if (isExpired(project, cutoffMs, appliesFromMs)) {
           expired.count += 1;
           expired.bytes += project.bytes;
         }
@@ -329,6 +333,7 @@ export class StorageService {
         ...expired,
         cutoff: new Date(cutoffMs).toISOString(),
         retentionDays: policy.draftRetentionDays,
+        appliesFrom: policy.retentionAppliesFrom,
       },
       topProjects: projects
         .filter(p => p.bytes > 0)
@@ -389,6 +394,7 @@ export class StorageService {
     const bucket = this.resolveBucket();
     const errors: string[] = [];
     const cutoffMs = Date.parse(stats.expiredDrafts.cutoff);
+    const appliesFromMs = Date.parse(stats.expiredDrafts.appliesFrom ?? '');
 
     // Borradores vencidos: se recalculan desde la lista completa de pedidos,
     // no desde el top-10 que expone `stats`.
@@ -419,7 +425,7 @@ export class StorageService {
           candidate.files = usage.files;
           candidate.lastFileAt = usage.lastFileMs ? new Date(usage.lastFileMs).toISOString() : null;
         }
-        if (isExpired(candidate, cutoffMs)) expiredItems.push(candidate);
+        if (isExpired(candidate, cutoffMs, appliesFromMs)) expiredItems.push(candidate);
       }
     }
 
@@ -452,6 +458,7 @@ export class StorageService {
       trigger: options.trigger,
       retentionDays: stats.expiredDrafts.retentionDays,
       cutoff: stats.expiredDrafts.cutoff,
+      appliesFrom: stats.expiredDrafts.appliesFrom,
       expiredDrafts: {
         count: expiredItems.length,
         bytes: expiredItems.reduce((sum, p) => sum + p.bytes, 0),
@@ -497,8 +504,20 @@ export class StorageService {
   }
 }
 
-/** Un borrador vence cuando su última edición es anterior al corte. Sin fecha, no se toca. */
-export function isExpired(project: Pick<ProjectUsage, 'lastEditedAt' | 'lastFileAt'>, cutoffMs: number): boolean {
+/**
+ * Un borrador vence cuando su última edición es anterior al corte, PERO solo si
+ * fue creado después de activarse la caducidad (`appliesFromMs`). Los que ya
+ * existían al activarla no vencen nunca, y sin fecha de activación, de creación
+ * o de edición no se toca ninguno: ante la duda, se conserva.
+ */
+export function isExpired(
+  project: Pick<ProjectUsage, 'createdAt' | 'lastEditedAt' | 'lastFileAt'>,
+  cutoffMs: number,
+  appliesFromMs: number,
+): boolean {
+  if (!Number.isFinite(appliesFromMs)) return false;
+  const createdMs = Date.parse(project.createdAt ?? '');
+  if (!Number.isFinite(createdMs) || createdMs < appliesFromMs) return false;
   const editedMs = Date.parse(project.lastEditedAt ?? '');
   if (!Number.isFinite(editedMs)) return false;
   // Si alguien subió fotos después de la última edición registrada, cuenta la subida.

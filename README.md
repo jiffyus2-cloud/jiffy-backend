@@ -112,8 +112,12 @@ Da servicio a la pestaña "Gestión de almacenamiento" del panel del dueño.
   fotos antes de crear el documento). Se cachea 5 minutos en memoria.
 - **`POST /storage/cleanup`** borra los borradores (`draft`, `saved_draft`)
   cuya última edición —o última subida a Storage, la más reciente de las dos—
-  es anterior a `hoy − draftRetentionDays`, junto con su carpeta, y las carpetas
-  huérfanas. Un borrador sin fecha no se toca. `dryRun: true` solo informa.
+  es anterior a `hoy − draftRetentionDays`, junto con su carpeta. **Solo vencen
+  los borradores creados después de `retentionAppliesFrom`**, la fecha en que
+  el dueño activó la caducidad (la fija el panel al guardar la política por
+  primera vez); los anteriores no se tocan nunca, y sin esa fecha no vence
+  ninguno. Un borrador sin fecha tampoco. Las carpetas huérfanas solo se borran
+  con `orphans: true` explícito. `dryRun: true` solo informa.
   El resumen de la última ejecución real queda en `settings/storage_status`.
 
 ### Limpieza programada

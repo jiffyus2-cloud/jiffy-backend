@@ -36,9 +36,11 @@ export class StorageController {
   }
 
   /**
-   * Borra los borradores que llevan más de `draftRetentionDays` sin editarse y,
-   * opcionalmente, las carpetas de Storage sin pedido. Con `dryRun: true` solo
-   * informa. Lo llama el panel (dueño) o Cloud Scheduler (`x-cleanup-token`).
+   * Borra los borradores creados después de activar la caducidad que llevan más
+   * de `draftRetentionDays` sin editarse. Las carpetas de Storage sin pedido solo
+   * se borran si se pide expresamente (`orphans: true`): tocan datos que ya
+   * existían y por defecto se conservan. Con `dryRun: true` solo informa. Lo
+   * llama el panel (dueño) o Cloud Scheduler (`x-cleanup-token`).
    */
   @Post('cleanup')
   @UseGuards(CleanupAuthGuard)
@@ -49,7 +51,7 @@ export class StorageController {
     return this.storageService.cleanup({
       dryRun: body?.dryRun === true,
       expiredDrafts: body?.expiredDrafts !== false,
-      orphans: body?.orphans !== false,
+      orphans: body?.orphans === true,
       trigger: request.cleanupTrigger ?? 'panel',
     });
   }
