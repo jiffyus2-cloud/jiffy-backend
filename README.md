@@ -92,3 +92,41 @@ con `/oneclic/*` y este servicio con 1clic.
   alta y para la rotación a los 90 días.
 - El 403 `agent_not_allowed` **no es un fallo**: la clave vale y solo falta que
   el dueño asigne un agente en 1clic. `GET /oneclic/status` lo muestra tal cual.
+
+## Gestión de almacenamiento (`src/storage`)
+
+Da servicio a la pestaña "Gestión de almacenamiento" del panel del dueño.
+
+- **Política** (`settings/storage_policy`): `maxDraftsPerUser` (borradores
+  simultáneos por usuario), `draftRetentionDays` (días sin editar tras los
+  cuales un borrador se borra) y `storageCapacityGb` (capacidad de referencia
+  para calcular el "disponible"). La escribe el panel directamente en Firestore;
+  el backend solo la lee. Los valores iniciales del código (5 / 90 / 5) rigen
+  únicamente mientras no exista el documento y nunca se escriben desde aquí.
+- **`GET /storage/stats`** recorre el bucket con el SDK de administrador y cruza
+  las carpetas `orders/{uid}/{orderId}/` con Firestore. Distingue borradores,
+  pedidos, imágenes de la tienda, **carpetas huérfanas** (sin pedido en
+  Firestore y sin escrituras en las últimas 24 h; `deleteSavedDraft` del
+  frontend borra el documento pero no las fotos) y **subidas en curso** (sin
+  pedido todavía, pero con escrituras recientes: `createDraftOrder` sube las
+  fotos antes de crear el documento). Se cachea 5 minutos en memoria.
+- **`POST /storage/cleanup`** borra los borradores (`draft`, `saved_draft`)
+  cuya última edición —o última subida a Storage, la más reciente de las dos—
+  es anterior a `hoy − draftRetentionDays`, junto con su carpeta, y las carpetas
+  huérfanas. Un borrador sin fecha no se toca. `dryRun: true` solo informa.
+  El resumen de la última ejecución real queda en `settings/storage_status`.
+
+### Limpieza programada
+
+Cloud Run escala a cero, así que un cron dentro del proceso no sirve. Se usa
+Cloud Scheduler llamando a `POST /storage/cleanup` con el header
+`x-cleanup-token`:
+
+```bash
+export STORAGE_CLEANUP_TOKEN="$(openssl rand -hex 32)"
+bash scripts/gcp/env-set.sh jiffy-backend STORAGE_CLEANUP_TOKEN="$STORAGE_CLEANUP_TOKEN"
+bash scripts/gcp/scheduler-cleanup.sh   # crea/actualiza el job diario (03:00 Bogotá)
+```
+
+(los dos scripts viven en el repo del frontend, `scripts/gcp/`). El job se
+puede probar a mano con `bash scripts/gcp/scheduler-cleanup.sh --run`.
