@@ -117,7 +117,11 @@ Da servicio a la pestaña "Gestión de almacenamiento" del panel del dueño.
   el dueño activó la caducidad (la fija el panel al guardar la política por
   primera vez); los anteriores no se tocan nunca, y sin esa fecha no vence
   ninguno. Un borrador sin fecha tampoco. Las carpetas huérfanas solo se borran
-  con `orphans: true` explícito. `dryRun: true` solo informa.
+  con `orphans: true` explícito. Una carpeta a la que apunten las fotos de
+  cualquier pedido vivo (un borrador creado a partir de otro reutiliza sus
+  fotos; los pedidos antiguos guardaban las fotos bajo otro id) **nunca** se
+  borra ni cuenta como huérfana, aunque su propio documento caduque.
+  `dryRun: true` solo informa.
   El resumen de la última ejecución real queda en `settings/storage_status`.
 
 ### Limpieza programada
