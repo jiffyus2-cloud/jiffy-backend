@@ -163,25 +163,54 @@ export class OneclicService {
     if (!message) throw new BadRequestException('Escribe qué quieres pedirle al agente.');
     if (!request.recordId) throw new BadRequestException('Falta el registro al que se aplica la propuesta.');
 
-    const agent = await this.resolveAgent(request.agentId);
+    const { result, agent } = await this.runTyped({
+      uid: request.uid,
+      agentId: request.agentId,
+      mode: request.mode,
+      message,
+      context: request.context,
+      responseSchema: PROPOSAL_RESPONSE_SCHEMA as unknown as Record<string, unknown>,
+      recordId: request.recordId,
+    });
+
+    return OneclicService.toProposal(result, agent);
+  }
+
+  /**
+   * Un run tipado con todas las reglas del contrato ya aplicadas: agente
+   * resuelto contra GET /agents, modo explícito, external_user_id estable,
+   * Idempotency-Key por registro + huella de la petición, y un run que acaba
+   * en error convertido en 502 en vez de devolverse vacío. Es lo que usan
+   * `propose` y el laboratorio de orden de álbumes.
+   */
+  async runTyped(params: {
+    uid: string;
+    agentId: string;
+    mode?: 'default' | 'dry_run';
+    message: string;
+    context?: unknown;
+    responseSchema: Record<string, unknown>;
+    recordId: string;
+  }): Promise<{ result: OneclicRunResult; agent: { id: string; name: string }; mode: 'default' | 'dry_run' }> {
+    const agent = await this.resolveAgent(params.agentId);
     // Un run real gasta de la cartera: solo si se pide 'default' con todas
     // las letras. Un modo ausente o mal escrito se queda en seco.
-    const mode = agent.id !== ONECLIC_TEST_AGENT_ID && request.mode === 'default' ? 'default' : 'dry_run';
+    const mode = agent.id !== ONECLIC_TEST_AGENT_ID && params.mode === 'default' ? 'default' : 'dry_run';
 
-    const context = trimContext(request.context);
+    const context = trimContext(params.context);
 
     let result: OneclicRunResult;
     try {
       result = await this.client.run(
         agent.id,
         {
-          external_user_id: OneclicService.externalUserId(request.uid),
-          message,
+          external_user_id: OneclicService.externalUserId(params.uid),
+          message: params.message,
           ...(context !== undefined ? { context } : {}),
-          response_schema: PROPOSAL_RESPONSE_SCHEMA as unknown as Record<string, unknown>,
+          response_schema: params.responseSchema,
           mode,
         },
-        buildIdempotencyKey(request.recordId, new Date(), OneclicService.requestFingerprint(agent.id, mode, message)),
+        buildIdempotencyKey(params.recordId, new Date(), OneclicService.requestFingerprint(agent.id, mode, params.message)),
       );
     } catch (error) {
       throw this.toHttp(error);
@@ -195,7 +224,7 @@ export class OneclicService {
       );
     }
 
-    return OneclicService.toProposal(result, agent);
+    return { result, agent, mode };
   }
 
   /**
