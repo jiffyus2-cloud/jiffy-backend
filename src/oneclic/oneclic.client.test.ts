@@ -97,12 +97,33 @@ describe('reglas puras', () => {
     assert.match(a, /^[0-9a-f]{64}$/);
   });
 
-  it('la respuesta tipada se consume como JSON y la prosa se conserva', () => {
+  it('la respuesta tipada se consume como JSON (con o sin valla json) y la prosa se conserva', () => {
     assert.deepEqual(parseTypedReply('{"summary":"s","proposal":"p","actions":["x",1]}'), {
       summary: 's', proposal: 'p', actions: ['x'],
     });
+    assert.deepEqual(parseTypedReply('```json\n{"summary":"s","proposal":"p"}\n```'), {
+      summary: 's', proposal: 'p', actions: [],
+    });
     assert.equal(parseTypedReply('texto plano'), null);
     assert.equal(parseTypedReply(null), null);
+  });
+
+  it('toProposal lee typed_response.data y no re-parsea reply', () => {
+    const proposal = OneclicService.toProposal({
+      run_id: 'r', reply: '```json\n{"summary":"del reply","proposal":"x"}\n```', cost_usd: 0, duration_ms: 1,
+      typed_response: { valid: true, errors: [], data: { summary: 'del documento', proposal: 'p', actions: null } },
+    }, { id: '1clic-test', name: 'T' });
+    assert.equal(proposal.summary, 'del documento');
+    assert.equal(proposal.proposal, 'p');
+    assert.deepEqual(proposal.actions, []);
+
+    // Sin documento válido: respaldo sobre reply, y si es prosa se muestra tal cual.
+    const prose = OneclicService.toProposal({
+      run_id: 'r', reply: 'No tengo detalles de la tarea.', cost_usd: 0, duration_ms: 1,
+      typed_response: { valid: false, errors: ['reply is not JSON'], data: null },
+    }, { id: '1clic-test', name: 'T' });
+    assert.equal(prose.summary, '');
+    assert.equal(prose.proposal, 'No tengo detalles de la tarea.');
   });
 });
 
@@ -144,7 +165,62 @@ describe('OneclicClient', () => {
     const { data } = await client.listAgents();
     assert.deepEqual(data, { agents: [] });
     assert.equal(calls.length, 2);
-    assert.deepEqual(sleep.waits, [2000]);
+    assert.deepEqual(sleep.waits, [2250]);
+  });
+
+  it('Retry-After: manda la cabecera, contada desde que llega el 429; el cuerpo solo si pide más', async () => {
+    // 1clic mide la cabecera. Un retry_after menor en el cuerpo no acorta la espera…
+    const a = fakeFetch([
+      jsonResponse(429, envelope('rate_limit_exceeded', { retryable: true, retry_after: 2 }), { 'retry-after': '3' }),
+      jsonResponse(200, { agents: [] }),
+    ]);
+    const sleepA = fakeSleep();
+    await new OneclicClient(CONFIG, a.impl, sleepA.impl).listAgents();
+    assert.deepEqual(sleepA.waits, [3250]);
+
+    // …y uno mayor sí la alarga.
+    const b = fakeFetch([
+      jsonResponse(429, envelope('rate_limit_exceeded', { retryable: true, retry_after: 6 }), { 'retry-after': '3' }),
+      jsonResponse(200, { agents: [] }),
+    ]);
+    const sleepB = fakeSleep();
+    await new OneclicClient(CONFIG, b.impl, sleepB.impl).listAgents();
+    assert.deepEqual(sleepB.waits, [6250]);
+  });
+
+  it('guion de conformidad: 503 → 429 → 200 a la misma petición, un reintento por código y la misma Idempotency-Key', async () => {
+    const { impl, calls } = fakeFetch([
+      jsonResponse(503, envelope('provider_unavailable', { retryable: true }), { 'retry-after': '5' }),
+      jsonResponse(429, envelope('rate_limit_exceeded', { retryable: true }), { 'retry-after': '3' }),
+      jsonResponse(200, { run_id: 'r1', reply: 'ok', cost_usd: 0, duration_ms: 5 }),
+    ]);
+    const sleep = fakeSleep();
+    const client = new OneclicClient(CONFIG, impl, sleep.impl);
+
+    const result = await client.run('1clic-test', { external_user_id: 'u', message: 'm' }, 'sess-2026-09-21-scripted-1');
+
+    assert.equal(result.run_id, 'r1');
+    assert.equal(calls.length, 3);
+    assert.deepEqual(sleep.waits, [5250, 3250]);
+    const keys = calls.map(c => (c.init!.headers as Record<string, string>)['Idempotency-Key']);
+    assert.deepEqual(keys, ['sess-2026-09-21-scripted-1', 'sess-2026-09-21-scripted-1', 'sess-2026-09-21-scripted-1']);
+  });
+
+  it('guion de conformidad: 503 → 429 → 402 para; el 402 no se reintenta', async () => {
+    const { impl, calls } = fakeFetch([
+      jsonResponse(503, envelope('provider_unavailable', { retryable: true }), { 'retry-after': '5' }),
+      jsonResponse(429, envelope('rate_limit_exceeded', { retryable: true }), { 'retry-after': '3' }),
+      jsonResponse(402, envelope('insufficient_quota', { retryable: false })),
+    ]);
+    const sleep = fakeSleep();
+    const client = new OneclicClient(CONFIG, impl, sleep.impl);
+
+    await assert.rejects(
+      client.run('1clic-test', { external_user_id: 'u', message: 'm' }, 'k'),
+      (e: OneclicApiError) => e.status === 402 && e.code === 'insufficient_quota',
+    );
+    assert.equal(calls.length, 3);
+    assert.deepEqual(sleep.waits, [5250, 3250]);
   });
 
   it('429 que se repite: falla tras el único reintento', async () => {
@@ -211,7 +287,7 @@ describe('OneclicClient', () => {
     assert.equal(result.reply, 'x');
     // El 429 lo absorbe request(): espera los 20 s de Retry-After y repite
     // la misma lectura; después el sondeo sigue con su cadencia (5 s).
-    assert.deepEqual(sleep.waits, [2000, 20000, 5000]);
+    assert.deepEqual(sleep.waits, [2000, 20250, 5000]);
   });
 
   it('403 agent_not_allowed llega entero, con su remediación', async () => {

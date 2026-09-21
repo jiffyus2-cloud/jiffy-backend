@@ -27,17 +27,27 @@ const CONTEXT_MAX_CHARS = 8000;
 export const PROPOSAL_RESPONSE_SCHEMA = {
   type: 'object',
   required: ['summary', 'proposal'],
-  additionalProperties: false,
   properties: {
     summary: { type: 'string', description: 'Una frase: qué propone y por qué.' },
     proposal: { type: 'string', description: 'La propuesta completa, en Markdown.' },
+    // Opcional y admite null: 1clic no comprueba un campo ausente, pero sí
+    // uno nulo, y un modelo que "no tiene pasos" tiende a mandar null.
     actions: {
-      type: 'array',
+      type: ['array', 'null'],
       description: 'Pasos concretos que una persona tendría que aprobar.',
       items: { type: 'string' },
     },
   },
 } as const;
+
+/**
+ * Lo que se le pide al agente en la verificación. Tiene que ser una tarea
+ * concreta: con un mensaje vago ("tarea sintética X") el modelo contesta en
+ * prosa pidiendo detalles, el reply no valida contra el esquema y la
+ * comprobación 9 (typed_response) falla.
+ */
+export const CONFORMANCE_TASK =
+  'Propón un resumen de un pedido de ejemplo de un álbum de fotos (20x20 cm, 40 páginas, tapa dura) para enviárselo a la clienta por WhatsApp: qué incluye, cuándo sale y qué debe revisar antes de aprobarlo.';
 
 export interface ProposalRequest {
   /** uid de Firebase de quien pide la propuesta; nunca sale de aquí en claro. */
@@ -223,7 +233,13 @@ export class OneclicService {
   }
 
   static toProposal(result: OneclicRunResult, agent: { id: string; name: string }): Proposal {
-    const parsed = parseTypedReply(result.reply);
+    // 1clic ya validó el documento contra response_schema: se lee de
+    // typed_response.data. `reply` es la propuesta en Markdown (a veces con
+    // valla \`\`\`json) y solo sirve de respaldo si no hubo documento válido.
+    const typed = result.typed_response;
+    const parsed = typed?.valid && typed.data && typeof typed.data === 'object'
+      ? normalizeTypedDocument(typed.data as Record<string, unknown>, result.reply)
+      : parseTypedReply(result.reply);
     return {
       run_id: result.run_id ?? null,
       agent,
@@ -287,32 +303,39 @@ export class OneclicService {
       return `${data.agents?.length ?? 0} agente(s) asignado(s); agente de prueba ${data.test_agent?.address ?? 'n/d'}.`;
     });
 
-    await record('run_sync', async () => {
-      const result = await this.client.run(
-        ONECLIC_TEST_AGENT_ID,
-        runBody(`Tarea sintética ${open.ref}: propón un resumen de un pedido de ejemplo.`),
-        buildIdempotencyKey(open.session_id, new Date(), 'sync'),
-      );
-      return `run ${result.run_id ?? 'n/d'} · typed=${result.typed_response?.valid ?? 'n/d'} · $${result.cost_usd ?? 0} · ${result.duration_ms ?? '?'} ms`;
-    });
+    // El guion de 1clic contesta, en orden, 503 (Retry-After 5) → 429
+    // (Retry-After 3) → 402 a los POST /run de la sesión. El cliente reintenta
+    // 503 y 429 una vez cada uno con la MISMA Idempotency-Key y se rinde en el
+    // 402 sin reintentar esa clave. Como no se sabe en cuántos POST reparte
+    // 1clic la secuencia, se lanzan hasta tres runs con claves distintas y se
+    // anota lo que devuelve cada uno; en cuanto uno sale bien se para.
+    for (let i = 1; i <= 3; i += 1) {
+      let ok = false;
+      await record(`run_scripted_${i}`, async () => {
+        const result = await this.client.run(
+          ONECLIC_TEST_AGENT_ID,
+          runBody(CONFORMANCE_TASK),
+          buildIdempotencyKey(open.session_id, new Date(), `scripted-${i}`),
+        );
+        ok = true;
+        return `run ${result.run_id ?? 'n/d'} · typed=${result.typed_response?.valid ?? 'n/d'} · ${result.cost_usd ?? 0} · ${result.duration_ms ?? '?'} ms`;
+      });
+      if (ok) break;
+    }
 
-    await record('run_sync_replay', async () => {
-      // Misma Idempotency-Key (sesión + fecha + 'sync'): debe volver el mismo run.
+    // El run "de verdad": asíncrono, con response_schema, sondeado a 2 s → 5 s
+    // → 10 s hasta que termine. De este sondeo lee 1clic las comprobaciones 3
+    // y 9, así que el documento tiene que validar: tarea concreta y lectura
+    // de typed_response.data.
+    await record('run_polled', async () => {
       const result = await this.client.run(
         ONECLIC_TEST_AGENT_ID,
-        runBody(`Tarea sintética ${open.ref}: propón un resumen de un pedido de ejemplo.`),
-        buildIdempotencyKey(open.session_id, new Date(), 'sync'),
+        { ...runBody(CONFORMANCE_TASK), async: true },
+        buildIdempotencyKey(open.session_id, new Date(), 'polled'),
       );
-      return `run ${result.run_id ?? 'n/d'} · deduplicated=${Boolean(result.deduplicated)}`;
-    });
-
-    await record('run_async', async () => {
-      const result = await this.client.run(
-        ONECLIC_TEST_AGENT_ID,
-        { ...runBody(`Tarea sintética ${open.ref} (asíncrona).`), async: true },
-        buildIdempotencyKey(open.session_id, new Date(), 'async'),
-      );
-      return `run ${result.run_id ?? 'n/d'} · status=${result.status ?? 'n/d'}`;
+      const typed = result.typed_response;
+      const doc = typed?.valid && typed.data && typeof typed.data === 'object' ? (typed.data as Record<string, unknown>) : null;
+      return `run ${result.run_id ?? 'n/d'} · status=${result.status ?? 'n/d'} · typed=${typed?.valid ?? 'n/d'}${typed?.errors?.length ? ` (${typed.errors.join('; ')})` : ''} · summary=${doc && typeof doc.summary === 'string' ? JSON.stringify(doc.summary.slice(0, 80)) : 'n/d'}`;
     });
 
     let grade: OneclicVerifyGrade;
@@ -375,16 +398,30 @@ function trimContext(context: unknown): unknown {
   return { truncated: true, text: text.slice(0, CONTEXT_MAX_CHARS - 40) };
 }
 
+/** El documento validado por 1clic, con los tipos que espera el panel. */
+export function normalizeTypedDocument(
+  doc: Record<string, unknown>,
+  reply: string | null,
+): { summary: string; proposal: string; actions: string[] } {
+  return {
+    summary: typeof doc.summary === 'string' ? doc.summary : '',
+    proposal: typeof doc.proposal === 'string' ? doc.proposal : (reply ?? ''),
+    actions: Array.isArray(doc.actions) ? doc.actions.filter((a: unknown): a is string => typeof a === 'string') : [],
+  };
+}
+
+/**
+ * Respaldo cuando no hay typed_response válido: intenta leer `reply` como
+ * JSON, quitando la valla \`\`\`json si la trae. Si es prosa, devuelve null y
+ * el panel la muestra tal cual.
+ */
 export function parseTypedReply(reply: string | null): { summary: string; proposal: string; actions: string[] } | null {
   if (!reply) return null;
+  const unfenced = reply.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   try {
-    const parsed = JSON.parse(reply);
+    const parsed = JSON.parse(unfenced);
     if (!parsed || typeof parsed !== 'object') return null;
-    return {
-      summary: typeof parsed.summary === 'string' ? parsed.summary : '',
-      proposal: typeof parsed.proposal === 'string' ? parsed.proposal : String(reply),
-      actions: Array.isArray(parsed.actions) ? parsed.actions.filter((a: unknown) => typeof a === 'string') : [],
-    };
+    return normalizeTypedDocument(parsed, reply);
   } catch {
     return null;
   }
