@@ -17,6 +17,10 @@ Firestore y Storage. Este servicio solo interviene en el pago y en la IA.
 | `GET` | `/oneclic/status` | ID token del dueño | Estado de la conexión con 1clic.ai y agentes disponibles |
 | `POST` | `/oneclic/propose` | ID token del dueño | Pide una propuesta a un agente de 1clic sobre un registro |
 | `POST` | `/oneclic/verify` | ID token del dueño | Ejecuta la prueba de conformidad de 1clic desde la plataforma |
+| `GET` | `/storage/policy` | ID token del dueño | Política de almacenamiento vigente (`settings/storage_policy`) |
+| `GET` | `/storage/stats` | ID token del dueño | Uso del bucket: totales, desglose, proyectos y usuarios que más ocupan, huérfanas, vencidos. `?refresh=1` fuerza el recálculo |
+| `DELETE` | `/storage/orders/:id` | ID token (el cliente dueño del pedido, solo borradores; o el dueño de la tienda) | Borra el pedido y su carpeta; las fotos que use otro pedido se mudan a él y se reescriben sus URLs. `?dryRun=1` solo informa |
+| `POST` | `/storage/cleanup` | ID token del dueño **o** `x-cleanup-token` | Borra borradores vencidos y, si se pide, carpetas huérfanas (`{ dryRun, expiredDrafts, orphans }`) |
 
 `create-checkout` recibe un `orderId` y toma el importe del pedido en Firestore.
 El `amount` que envíe el cliente se ignora a efectos de cobro.
@@ -58,7 +62,9 @@ cuenta de servicio.
 | `ALLOWED_ORIGINS` | — | Lista de orígenes CORS separada por comas. Si no se define se usa `FRONTEND_URL` más los puertos de desarrollo; si tampoco hay `FRONTEND_URL`, CORS queda abierto y se avisa por consola. **Conviene definirla en producción.** |
 | `ONECLIC_API_KEY` | — | Clave de 1clic.ai (la que devuelve `POST /api/v1/keys/provision`, prefijo `1cg_`). Sin ella `/ai/*` responde 500 y `/oneclic/*` responde 503. **Nunca en el repo ni en un log.** |
 | `ONECLIC_CONNECTION_ID` | — | Id de la conexión de 1clic que nombra este despliegue. No es secreto, pero va en el entorno para que staging no escriba en la conexión de producción. |
-| `OWNER_EMAIL` | `jiffyus2@gmail.com` | Correo que `OwnerGuard` acepta para `/oneclic/*` (mismo criterio que `isOwner()` en las reglas de Firestore). |
+| `OWNER_EMAIL` | `jiffyus2@gmail.com` | Correo que `OwnerGuard` acepta para `/oneclic/*` y `/storage/*` (mismo criterio que `isOwner()` en las reglas de Firestore). |
+| `FIREBASE_STORAGE_BUCKET` | `<FIREBASE_PROJECT_ID>.firebasestorage.app` | Bucket que recorre `/storage/stats`. Solo hace falta si el nombre no sigue el patrón por defecto. |
+| `STORAGE_CLEANUP_TOKEN` | — | Token que Cloud Scheduler manda en `x-cleanup-token` para `POST /storage/cleanup`. Sin definir, solo el dueño puede lanzar la limpieza. **Nunca en el repo ni en un log.** |
 
 ## Desarrollo
 
@@ -120,8 +126,14 @@ Da servicio a la pestaña "Gestión de almacenamiento" del panel del dueño.
   con `orphans: true` explícito. Una carpeta a la que apunten las fotos de
   cualquier pedido vivo (un borrador creado a partir de otro reutiliza sus
   fotos; los pedidos antiguos guardaban las fotos bajo otro id) **nunca** se
-  borra ni cuenta como huérfana, aunque su propio documento caduque.
-  `dryRun: true` solo informa.
+  borra: al retirar la carpeta (borrado del pedido, caducidad o limpieza de
+  huérfanas) esos archivos se **mueven** a la carpeta del pedido que los usa y
+  se reescribe la URL en su documento (`retireFolder`; helpers puros en
+  `folder-retire.ts`). `dryRun: true` solo informa.
+- **`DELETE /storage/orders/:id`** es la única vía de borrado de pedidos que no
+  deja fotos huérfanas: la usan el cliente (sus borradores) y el panel del
+  dueño (cualquier pedido). Borrar solo el documento desde el navegador dejaba
+  la carpeta entera en Storage; así se acumularon 15 GB.
   El resumen de la última ejecución real queda en `settings/storage_status`.
 
 ### Limpieza programada

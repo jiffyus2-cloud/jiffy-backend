@@ -4,7 +4,7 @@
   "scripts": {
     "build": "nest build",
     "start": "node dist/main",
-    "test": "nest build && node --test dist/oneclic/oneclic.client.test.js dist/storage/storage.test.js"
+    "test": "nest build && node --test dist/oneclic/oneclic.client.test.js dist/storage/storage.test.js dist/storage/folder-retire.test.js"
   },
   "dependencies": {
     "@nestjs/common": "^10.0.0",

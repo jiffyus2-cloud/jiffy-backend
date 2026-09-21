@@ -1,7 +1,10 @@
-import { Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import * as admin from 'firebase-admin';
 import { getFirestore } from '../firebase/firebase-admin';
+import { ownerEmail } from '../middleware/owner.guard';
 import { DRAFT_STATUSES, StoragePolicy, readStoragePolicy } from './storage-policy';
+import { destinationPath, referencedFilesInFolder, rewriteFileReferences } from './folder-retire';
 
 /**
  * Gestión de almacenamiento: cuánto ocupa el bucket, quién lo consume y
@@ -106,8 +109,37 @@ export interface CleanupSummary {
   appliesFrom: string | null;
   expiredDrafts: { count: number; bytes: number };
   orphans: { count: number; bytes: number };
+  /** Archivos que se mudaron al pedido que los usa en vez de borrarse. */
+  movedFiles: number;
   errors: string[];
 }
+
+/** Un archivo que, en vez de borrarse, se mudó al pedido que lo usa. */
+export interface MovedFile {
+  from: string;
+  to: string;
+  /** Pedidos cuyo documento se reescribió para apuntar a la nueva ruta. */
+  rewrittenOrders: string[];
+  bytes: number;
+}
+
+export interface RetireResult {
+  userId: string;
+  orderId: string;
+  dryRun: boolean;
+  deletedFiles: number;
+  deletedBytes: number;
+  moved: MovedFile[];
+  errors: string[];
+}
+
+export interface DeleteOrderResult extends RetireResult {
+  /** true si el documento existía y se borró (o se borraría, en dryRun). */
+  documentDeleted: boolean;
+}
+
+/** Estados en los que un cliente puede borrar su propio pedido. El dueño, cualquiera. */
+const CUSTOMER_DELETABLE_STATUSES: readonly string[] = ['draft', 'saved_draft', 'pending_payment'];
 
 export interface CleanupResult extends CleanupSummary {
   expiredDrafts: { count: number; bytes: number; items: ProjectUsage[] };
@@ -278,8 +310,9 @@ export class StorageService {
     const byUser = new Map<string, UserUsage>();
 
     for (const project of projects) {
-      // Huérfana = sin documento propio Y sin ningún pedido vivo que use sus fotos.
-      const isOrphan = !orders.has(project.orderId) && project.sharedWith.length === 0;
+      // Huérfana = sin documento propio. Si otro pedido usa parte de sus fotos
+      // (`sharedWith`), la limpieza las muda a ese pedido antes de borrar el resto.
+      const isOrphan = !orders.has(project.orderId);
       if (isOrphan) {
         const lastMs = Date.parse(project.lastFileAt ?? '') || 0;
         const target = now - lastMs > ORPHAN_GRACE_MS ? orphans : inProgress;
@@ -445,16 +478,16 @@ export class StorageService {
 
     const orphanItems = options.orphans ? stats.orphans : [];
 
+    let movedFiles = 0;
     if (!options.dryRun) {
       const db = getFirestore();
       for (const item of expiredItems) {
         try {
-          // El documento caduca siempre; la carpeta solo si ningún otro pedido
-          // vivo apunta a sus fotos (si no, se conserva y se deja constancia).
-          if (item.userId && item.sharedWith.length === 0) {
-            await bucket.deleteFiles({ prefix: `orders/${item.userId}/${item.orderId}/`, force: true });
-          } else if (item.sharedWith.length > 0) {
-            errors.push(`borrador ${item.orderId}: documento borrado, carpeta conservada porque la usan ${item.sharedWith.join(', ')}`);
+          // Las fotos que use otro pedido se mudan a su carpeta; el resto se borra.
+          if (item.userId) {
+            const retired = await this.retireFolder(bucket, item.userId, item.orderId, { skipOrderIds: [item.orderId], dryRun: false });
+            movedFiles += retired.moved.length;
+            errors.push(...retired.errors);
           }
           await db.collection('orders').doc(item.orderId).delete();
         } catch (error: any) {
@@ -462,9 +495,10 @@ export class StorageService {
         }
       }
       for (const item of orphanItems) {
-        if (item.sharedWith.length > 0) continue; // nunca: la usa un pedido vivo
         try {
-          await bucket.deleteFiles({ prefix: `orders/${item.userId}/${item.orderId}/`, force: true });
+          const retired = await this.retireFolder(bucket, item.userId, item.orderId, { skipOrderIds: [], dryRun: false });
+          movedFiles += retired.moved.length;
+          errors.push(...retired.errors);
         } catch (error: any) {
           errors.push(`carpeta ${item.userId}/${item.orderId}: ${error?.message ?? error}`);
         }
@@ -488,6 +522,7 @@ export class StorageService {
         bytes: orphanItems.reduce((sum, p) => sum + p.bytes, 0),
         items: orphanItems,
       },
+      movedFiles,
       errors,
     };
 
@@ -499,6 +534,7 @@ export class StorageService {
         ...result,
         expiredDrafts: { count: result.expiredDrafts.count, bytes: result.expiredDrafts.bytes },
         orphans: { count: result.orphans.count, bytes: result.orphans.bytes },
+        movedFiles,
       };
       await getFirestore().doc(STORAGE_STATUS_DOC).set({ lastCleanup: summary }, { merge: true });
       console.log(
@@ -508,6 +544,129 @@ export class StorageService {
       );
     }
 
+    return result;
+  }
+
+  // ── Borrado de un pedido ────────────────────────────────────────────────────
+
+  /**
+   * Borra un pedido con sus fotos. Lo puede pedir el dueño de la tienda (cualquier
+   * pedido) o el cliente al que pertenece (solo borradores y pendientes de pago).
+   * Las fotos que use otro pedido vivo se mudan a su carpeta en vez de borrarse.
+   */
+  async deleteOrder(orderId: string, requester: { uid: string; email?: string }, dryRun = false): Promise<DeleteOrderResult> {
+    const db = getFirestore();
+    const ref = db.collection('orders').doc(orderId);
+    const snap = await ref.get();
+    if (!snap.exists) throw new NotFoundException(`El pedido ${orderId} no existe`);
+    const data = snap.data() as Record<string, any>;
+    const userId = String(data.userId ?? '');
+
+    const isOwner = String(requester.email ?? '').toLowerCase() === ownerEmail();
+    if (!isOwner) {
+      if (userId !== requester.uid) throw new ForbiddenException('Este pedido no es tuyo');
+      if (!CUSTOMER_DELETABLE_STATUSES.includes(String(data.status ?? ''))) {
+        throw new ForbiddenException('Un pedido pagado o en producción solo lo puede borrar la tienda');
+      }
+    }
+
+    const bucket = this.resolveBucket();
+    const retired = userId
+      ? await this.retireFolder(bucket, userId, orderId, { skipOrderIds: [orderId], dryRun })
+      : { userId, orderId, dryRun, deletedFiles: 0, deletedBytes: 0, moved: [], errors: [] };
+    if (!dryRun) {
+      await ref.delete();
+      this.invalidate();
+      console.log(
+        `[storage] Pedido ${orderId} borrado por ${isOwner ? 'la tienda' : 'su cliente'}: ` +
+          `${retired.deletedFiles} archivos (${retired.deletedBytes} bytes), ${retired.moved.length} mudados`,
+      );
+    }
+    return { ...retired, documentDeleted: true };
+  }
+
+  /**
+   * Retira la carpeta `orders/{userId}/{orderId}/` sin dejar a nadie sin fotos:
+   * cada archivo al que apunte otro pedido vivo (distinto de `skipOrderIds`) se
+   * MUEVE a la carpeta de ese pedido y se reescribe la URL en su documento; lo
+   * que no usa nadie se borra. Con `dryRun` solo describe lo que haría.
+   */
+  async retireFolder(
+    bucket: StorageBucket,
+    userId: string,
+    orderId: string,
+    options: { skipOrderIds: string[]; dryRun: boolean },
+  ): Promise<RetireResult> {
+    const prefix = `orders/${userId}/${orderId}/`;
+    const result: RetireResult = { userId, orderId, dryRun: options.dryRun, deletedFiles: 0, deletedBytes: 0, moved: [], errors: [] };
+    const [files] = await bucket.getFiles({ prefix });
+    if (files.length === 0) return result;
+
+    // Quién usa cada archivo de la carpeta (documentos enteros: hay que leer sus URLs).
+    const db = getFirestore();
+    const snap = await db.collection('orders').get();
+    const holdersByPath = new Map<string, { id: string; userId: string; data: Record<string, any> }[]>();
+    for (const doc of snap.docs) {
+      if (options.skipOrderIds.includes(doc.id)) continue;
+      const data = doc.data() as Record<string, any>;
+      for (const path of referencedFilesInFolder(data, userId, orderId)) {
+        holdersByPath.set(path, [...(holdersByPath.get(path) ?? []), { id: doc.id, userId: String(data.userId ?? userId), data }]);
+      }
+    }
+
+    const byPath = new Map(files.map(f => [f.name, f]));
+    const movedAway = new Set<string>();
+
+    for (const [path, holders] of holdersByPath) {
+      const file = byPath.get(path);
+      if (!file) continue; // la URL apunta a un archivo que ya no existe
+      const bytes = Number(file.metadata?.size ?? 0) || 0;
+      // Se muda al primer pedido que lo usa; los demás pasan a apuntar allí.
+      const target = holders[0];
+      const [existing] = await bucket.getFiles({ prefix: `orders/${target.userId}/${target.id}/` });
+      const taken = new Set(existing.map(f => f.name));
+      const to = destinationPath(path, target.userId, target.id, candidate => taken.has(candidate));
+
+      const moved: MovedFile = { from: path, to, rewrittenOrders: [], bytes };
+      if (!options.dryRun) {
+        try {
+          // La URL de descarga lleva un token que vive en los metadatos del
+          // archivo. La copia los conserva, pero si no llegara se repone el
+          // MISMO token de origen: así la URL reescrita (solo cambia la ruta)
+          // sigue siendo válida.
+          const sourceToken = String(file.metadata?.metadata?.firebaseStorageDownloadTokens ?? '');
+          await file.move(to);
+          const dest = bucket.file(to);
+          const [meta] = await dest.getMetadata();
+          if (!meta.metadata?.firebaseStorageDownloadTokens) {
+            await dest.setMetadata({ metadata: { firebaseStorageDownloadTokens: sourceToken || randomUUID() } });
+          }
+          for (const holder of holders) {
+            const { value, changed } = rewriteFileReferences(holder.data, path, to);
+            if (!changed) continue;
+            await db.collection('orders').doc(holder.id).set(value);
+            holder.data = value; // por si otro archivo de esta misma carpeta también es suyo
+            moved.rewrittenOrders.push(holder.id);
+          }
+        } catch (error: any) {
+          result.errors.push(`mover ${path} → ${to}: ${error?.message ?? error}`);
+          continue;
+        }
+      } else {
+        moved.rewrittenOrders = holders.map(h => h.id);
+      }
+      movedAway.add(path);
+      result.moved.push(moved);
+    }
+
+    for (const file of files) {
+      if (movedAway.has(file.name)) continue;
+      result.deletedFiles += 1;
+      result.deletedBytes += Number(file.metadata?.size ?? 0) || 0;
+    }
+    if (!options.dryRun && result.deletedFiles > 0) {
+      await bucket.deleteFiles({ prefix, force: true });
+    }
     return result;
   }
 

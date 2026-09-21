@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { FirebaseAuthGuard } from '../middleware/firebase-auth.guard';
 import { OwnerGuard } from '../middleware/owner.guard';
 import { CleanupAuthGuard } from './cleanup-auth.guard';
 import { StorageService } from './storage.service';
@@ -33,6 +34,23 @@ export class StorageController {
   @UseGuards(OwnerGuard)
   stats(@Query('refresh') refresh?: string) {
     return this.storageService.getStats(refresh === '1' || refresh === 'true');
+  }
+
+  /**
+   * Borra un pedido con sus fotos. Lo usa el cliente para borrar sus borradores
+   * (desde "Mis proyectos" y el editor) y el panel del dueño para cualquier
+   * pedido. Es la ÚNICA vía de borrado que no deja carpetas huérfanas: las fotos
+   * resto se borra junto con el documento. `?dryRun=1` solo describe qué haría.
+   * resto se borra junto con el documento.  solo describe qué haría.
+   */
+  @Delete('orders/:orderId')
+  @UseGuards(FirebaseAuthGuard)
+  deleteOrder(
+    @Param('orderId') orderId: string,
+    @Req() request: { user: { uid: string; email?: string } },
+    @Query('dryRun') dryRun?: string,
+  ) {
+    return this.storageService.deleteOrder(orderId, request.user, dryRun === '1' || dryRun === 'true');
   }
 
   /**
