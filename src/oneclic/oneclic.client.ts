@@ -71,7 +71,12 @@ export interface OneclicRunResult {
   stop_reason?: string | null;
   dry_run?: boolean;
   deduplicated?: boolean;
-  typed_response?: { valid: boolean; errors?: string[] } | null;
+  /**
+   * Presente si se mandó response_schema. `data` es el documento ya validado
+   * por 1clic: es lo que hay que leer. `reply` es la propuesta en Markdown (y
+   * puede venir con una valla de código json), no se re-parsea.
+   */
+  typed_response?: { valid: boolean; errors?: string[]; data?: unknown } | null;
 }
 
 export type OneclicEventStep =
@@ -197,8 +202,11 @@ export function parseErrorEnvelope(
     envelope = null;
   }
 
+  // La cabecera Retry-After es la que cuenta (es lo que mide 1clic); si el
+  // cuerpo trae un retry_after mayor, se respeta el mayor de los dos.
   const headerRetry = parseRetryAfter(retryAfterHeader);
-  const retryAfter = typeof envelope?.retry_after === 'number' ? envelope.retry_after : headerRetry;
+  const bodyRetry = typeof envelope?.retry_after === 'number' ? Math.max(0, Math.ceil(envelope.retry_after)) : null;
+  const retryAfter = headerRetry != null && bodyRetry != null ? Math.max(headerRetry, bodyRetry) : headerRetry ?? bodyRetry;
 
   if (envelope && typeof envelope === 'object') {
     return new OneclicApiError(
@@ -260,6 +268,8 @@ export function buildIdempotencyKey(recordId: string, attemptDate: Date = new Da
   return `${safeRecord}-${attemptDate.toISOString().slice(0, 10)}${suffix}`;
 }
 
+/** Colchón sobre Retry-After: cubre la granularidad del reloj y que la espera empieza tras leer el cuerpo. */
+export const RETRY_AFTER_MARGIN_MS = 250;
 /** Tope de espera para no dejar colgada una petición HTTP del navegador. */
 export const MAX_RETRY_WAIT_MS = 30_000;
 export const MAX_POLL_WAIT_MS = 90_000;
@@ -300,9 +310,15 @@ export class OneclicClient {
 
   /**
    * Una petición con las reglas de reintento del contrato:
-   * - 429 retryable → espera `Retry-After` y reintenta una sola vez.
+   * - 429 → espera `Retry-After` (la CABECERA; el cuerpo solo si es mayor)
+   *   contando desde que llega la respuesta, y reintenta una sola vez.
+   * - 5xx → igual, un solo reintento (Retry-After o una espera corta).
    * - 402 → nunca se reintenta.
-   * - 5xx retryable → un reintento con espera corta.
+   *
+   * "Una sola vez" es por código de estado, no por petición: la prueba de
+   * conformidad de 1clic responde 503 → 429 → 200 a la MISMA petición (misma
+   * Idempotency-Key), y cada uno de esos se reintenta una vez. Dos 429
+   * seguidos sí se rinden.
    */
   async request<T>(method: 'GET' | 'POST', path: string, options: RequestOptions = {}): Promise<{ status: number; data: T }> {
     const { body, headers = {}, auth = true } = options;
@@ -321,7 +337,7 @@ export class OneclicClient {
     };
 
     const url = `${this.config.apiUrl}${path}`;
-    let attempt = 0;
+    const retried = new Set<number>();
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -337,14 +353,17 @@ export class OneclicClient {
       // 402: cartera vacía. Se muestra y se para; reintentar solo repetiría el fallo.
       if (response.status === 402) throw error;
 
-      const canRetry = attempt === 0 && error.retryable && (response.status === 429 || response.status >= 500);
+      const transient = response.status === 429 || response.status >= 500;
+      const canRetry = transient && !retried.has(response.status) && (error.retryable || error.retryAfter != null);
       if (!canRetry) throw error;
 
       const waitMs = Math.min(
-        (error.retryAfter ?? (response.status === 429 ? 5 : 2)) * 1000,
+        (error.retryAfter ?? (response.status === 429 ? 5 : 2)) * 1000 + RETRY_AFTER_MARGIN_MS,
         MAX_RETRY_WAIT_MS,
       );
-      attempt += 1;
+      retried.add(response.status);
+      // El reloj de Retry-After arranca cuando LLEGA la respuesta (no cuando se
+      // mandó la petición): la espera empieza aquí, con la respuesta ya en mano.
       await this.sleep(waitMs);
     }
   }
