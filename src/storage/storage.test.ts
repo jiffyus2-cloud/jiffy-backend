@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { INITIAL_STORAGE_POLICY, mergeStoragePolicy } from './storage-policy';
-import { isExpired, toIso } from './storage.service';
+import { isExpired, referencedFolders, toIso } from './storage.service';
 
 // Se ejecutan sobre el JS compilado (ver el script `test` de package.json).
 
@@ -89,5 +89,24 @@ describe('toIso', () => {
     assert.equal(toIso(''), null);
     assert.equal(toIso('ayer'), null);
     assert.equal(toIso(42), null);
+  });
+});
+
+describe('referencedFolders', () => {
+  it('encuentra las carpetas a las que apuntan las URLs de descarga (ruta codificada)', () => {
+    const order = {
+      photos: [{ url: 'https://firebasestorage.googleapis.com/v0/b/x.firebasestorage.app/o/orders%2Fuid1%2ForderA%2Fphoto_1.jpg?alt=media&token=t' }],
+      coverData: { image: 'https://firebasestorage.googleapis.com/v0/b/x/o/orders%2Fuid1%2ForderB%2Fcover.jpg?alt=media' },
+    };
+    assert.deepEqual([...referencedFolders(order)].sort(), ['uid1/orderA', 'uid1/orderB']);
+  });
+
+  it('acepta también rutas sin codificar y no confunde otros textos', () => {
+    const order = { pages: [{ img: 'gs://x/orders/uid2/orderC/p.jpg' }], note: 'sin orders aquí', other: 'orders/only-two/' };
+    assert.deepEqual([...referencedFolders(order)], ['uid2/orderC']);
+  });
+
+  it('un pedido sin fotos no referencia nada', () => {
+    assert.equal(referencedFolders({ status: 'draft' }).size, 0);
   });
 });

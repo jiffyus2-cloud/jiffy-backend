@@ -33,6 +33,12 @@ export interface ProjectUsage {
   lastEditedAt: string | null;
   /** Última escritura en Storage dentro de la carpeta. */
   lastFileAt: string | null;
+  /**
+   * Otros pedidos vivos cuyas fotos apuntan a esta carpeta (un borrador creado
+   * a partir de otro reutiliza sus fotos sin resubirlas). Mientras haya alguno,
+   * la carpeta no se borra aunque su propio pedido caduque o no exista.
+   */
+  sharedWith: string[];
 }
 
 export interface UserUsage {
@@ -174,7 +180,7 @@ export class StorageService {
 
   private async computeStats(): Promise<StorageStats> {
     const bucket = this.resolveBucket();
-    const [policy, orders, users] = await Promise.all([
+    const [policy, { orders, referenced }, users] = await Promise.all([
       readStoragePolicy(),
       this.loadOrders(),
       this.loadUsers(),
@@ -220,7 +226,8 @@ export class StorageService {
 
     for (const [key, folder] of folders) {
       const [userId, orderId] = key.split('/');
-      const meta = orders.get(orderId) ?? null;
+      const sharedWith = referenced.get(key) ?? [];
+      const meta = orders.get(orderId) ?? (sharedWith.length ? orders.get(sharedWith[0]) ?? null : null);
       seenOrders.add(orderId);
       projects.push({
         orderId,
@@ -235,6 +242,7 @@ export class StorageService {
         createdAt: meta?.createdAt ?? null,
         lastEditedAt: meta?.lastEditedAt ?? null,
         lastFileAt: folder.lastFileMs ? new Date(folder.lastFileMs).toISOString() : null,
+        sharedWith,
       });
     }
     // Pedidos que existen en Firestore pero no tienen carpeta (o quedaron sin fotos).
@@ -253,6 +261,7 @@ export class StorageService {
         createdAt: meta.createdAt,
         lastEditedAt: meta.lastEditedAt,
         lastFileAt: null,
+        sharedWith: [],
       });
     }
 
@@ -269,7 +278,8 @@ export class StorageService {
     const byUser = new Map<string, UserUsage>();
 
     for (const project of projects) {
-      const isOrphan = !orders.has(project.orderId);
+      // Huérfana = sin documento propio Y sin ningún pedido vivo que use sus fotos.
+      const isOrphan = !orders.has(project.orderId) && project.sharedWith.length === 0;
       if (isOrphan) {
         const lastMs = Date.parse(project.lastFileAt ?? '') || 0;
         const target = now - lastMs > ORPHAN_GRACE_MS ? orphans : inProgress;
@@ -348,15 +358,18 @@ export class StorageService {
     return stats;
   }
 
-  private async loadOrders(): Promise<Map<string, OrderMeta>> {
-    // `select` evita traer páginas y fotos: solo los campos que necesitamos.
-    const snap = await getFirestore()
-      .collection('orders')
-      .select('userId', 'status', 'productType', 'product.name', 'customerName', 'customerEmail', 'createdAt', 'updatedAt')
-      .get();
+  private async loadOrders(): Promise<{ orders: Map<string, OrderMeta>; referenced: Map<string, string[]> }> {
+    // Se traen los documentos enteros: hace falta recorrer sus URLs para saber
+    // qué carpetas usa cada pedido, que no siempre es la que lleva su propio id.
+    const snap = await getFirestore().collection('orders').get();
     const map = new Map<string, OrderMeta>();
+    const referenced = new Map<string, string[]>();
     snap.forEach(doc => {
       const d = doc.data() as Record<string, any>;
+      for (const key of referencedFolders(d)) {
+        if (key.split('/')[1] === doc.id) continue;
+        referenced.set(key, [...(referenced.get(key) ?? []), doc.id]);
+      }
       const createdAt = toIso(d.createdAt);
       map.set(doc.id, {
         userId: d.userId ?? null,
@@ -369,7 +382,7 @@ export class StorageService {
         lastEditedAt: toIso(d.updatedAt) ?? createdAt,
       });
     });
-    return map;
+    return { orders: map, referenced };
   }
 
   private async loadUsers(): Promise<Map<string, { name: string | null; email: string | null }>> {
@@ -400,7 +413,7 @@ export class StorageService {
     // no desde el top-10 que expone `stats`.
     const expiredItems: ProjectUsage[] = [];
     if (options.expiredDrafts) {
-      const orders = await this.loadOrders();
+      const { orders, referenced } = await this.loadOrders();
       const byFolder = new Map(stats.topProjects.map(p => [p.orderId, p]));
       for (const [orderId, meta] of orders) {
         if (!DRAFT_STATUSES.includes(meta.status ?? '')) continue;
@@ -417,6 +430,7 @@ export class StorageService {
           createdAt: meta.createdAt,
           lastEditedAt: meta.lastEditedAt,
           lastFileAt: null,
+          sharedWith: referenced.get(`${meta.userId}/${orderId}`) ?? [],
         };
         if (!byFolder.has(orderId) && candidate.userId) {
           // Fuera del top no conocemos la carpeta: se mide para decidir y para informar.
@@ -435,8 +449,12 @@ export class StorageService {
       const db = getFirestore();
       for (const item of expiredItems) {
         try {
-          if (item.userId) {
+          // El documento caduca siempre; la carpeta solo si ningún otro pedido
+          // vivo apunta a sus fotos (si no, se conserva y se deja constancia).
+          if (item.userId && item.sharedWith.length === 0) {
             await bucket.deleteFiles({ prefix: `orders/${item.userId}/${item.orderId}/`, force: true });
+          } else if (item.sharedWith.length > 0) {
+            errors.push(`borrador ${item.orderId}: documento borrado, carpeta conservada porque la usan ${item.sharedWith.join(', ')}`);
           }
           await db.collection('orders').doc(item.orderId).delete();
         } catch (error: any) {
@@ -444,6 +462,7 @@ export class StorageService {
         }
       }
       for (const item of orphanItems) {
+        if (item.sharedWith.length > 0) continue; // nunca: la usa un pedido vivo
         try {
           await bucket.deleteFiles({ prefix: `orders/${item.userId}/${item.orderId}/`, force: true });
         } catch (error: any) {
@@ -523,6 +542,23 @@ export function isExpired(
   // Si alguien subió fotos después de la última edición registrada, cuenta la subida.
   const fileMs = Date.parse(project.lastFileAt ?? '') || 0;
   return Math.max(editedMs, fileMs) < cutoffMs;
+}
+
+/**
+ * Carpetas `uid/orderId` a las que apuntan las URLs de un pedido. Las URLs de
+ * descarga llevan la ruta codificada (`orders%2Fuid%2Fid%2F...`); las rutas
+ * `gs://` o relativas van sin codificar.
+ */
+export function referencedFolders(order: Record<string, unknown>): Set<string> {
+  const json = JSON.stringify(order);
+  const keys = new Set<string>();
+  // JSON.stringify escapa las barras de las URLs como `\/`, de ahí el `\\?\/`.
+  const sep = String.raw`(?:%2F|\\?\/)`;
+  const pattern = new RegExp(`orders${sep}([A-Za-z0-9_-]+)${sep}([A-Za-z0-9_-]+)${sep}`, 'g');
+  for (const m of json.matchAll(pattern)) {
+    keys.add(`${m[1]}/${m[2]}`);
+  }
+  return keys;
 }
 
 /** ISO string desde un ISO string, un Timestamp de Firestore o un Date. */
