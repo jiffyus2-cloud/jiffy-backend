@@ -5,6 +5,7 @@ import { AiModule } from './ai/ai.module'; // <-- 1. Importamos el nuevo módulo
 import { DiscountsModule } from './discounts/discounts.module';
 import { OneclicModule } from './oneclic/oneclic.module';
 import { StorageModule } from './storage/storage.module';
+import { EmailModule } from './email/email.module';
 
 @Module({
   imports: [
@@ -13,6 +14,7 @@ import { StorageModule } from './storage/storage.module';
     DiscountsModule,
     OneclicModule, // Conexión con 1clic.ai (aislado: se puede quitar sin tocar nada más)
     StorageModule, // Gestión de almacenamiento (uso del bucket y limpieza de borradores)
+    EmailModule, // Correos masivos a usuarios registrados (pestaña Correos) y baja pública
   ],
   controllers: [AppController],
   providers: [],

@@ -17,6 +17,12 @@ Firestore y Storage. Este servicio solo interviene en el pago y en la IA.
 | `GET` | `/oneclic/status` | ID token del dueño | Estado de la conexión con 1clic.ai y agentes disponibles |
 | `POST` | `/oneclic/propose` | ID token del dueño | Pide una propuesta a un agente de 1clic sobre un registro |
 | `POST` | `/oneclic/verify` | ID token del dueño | Ejecuta la prueba de conformidad de 1clic desde la plataforma |
+| `GET` | `/email/status` | ID token del dueño | Qué variables de correo faltan (nombres, nunca valores) |
+| `POST` | `/email/audience` | ID token del dueño | Nº de destinatarios de un segmento, descontadas las bajas |
+| `POST` | `/email/preview` | ID token del dueño | HTML/texto final de una campaña para un destinatario de ejemplo |
+| `POST` | `/email/test` | ID token del dueño | Envía la campaña a un único correo con `[PRUEBA]` en el asunto |
+| `GET`/`POST` | `/email/campaigns` | ID token del dueño | Historial / envío masivo de una campaña |
+| `GET`/`POST` | `/email/unsubscribe?token=…` | Token firmado | Baja pública (GET confirma, POST da de baja; también baja en un clic) |
 
 `create-checkout` recibe un `orderId` y toma el importe del pedido en Firestore.
 El `amount` que envíe el cliente se ignora a efectos de cobro.
@@ -59,6 +65,13 @@ cuenta de servicio.
 | `ONECLIC_API_KEY` | — | Clave de 1clic.ai (la que devuelve `POST /api/v1/keys/provision`, prefijo `1cg_`). Sin ella `/ai/*` responde 500 y `/oneclic/*` responde 503. **Nunca en el repo ni en un log.** |
 | `ONECLIC_CONNECTION_ID` | — | Id de la conexión de 1clic que nombra este despliegue. No es secreto, pero va en el entorno para que staging no escriba en la conexión de producción. |
 | `OWNER_EMAIL` | `jiffyus2@gmail.com` | Correo que `OwnerGuard` acepta para `/oneclic/*` (mismo criterio que `isOwner()` en las reglas de Firestore). |
+| `EMAIL_PROVIDER` | `resend` | Proveedor de los correos masivos (único implementado: Resend). |
+| `EMAIL_PROVIDER_API_KEY` | — | Clave del proveedor (`re_…` en Resend). Sin ella `/email/test` y el envío responden 503. **Secreta.** |
+| `EMAIL_FROM` | — | Remitente, p. ej. `Jiffy Photos <hola@jiffyphotos.com>`. Su dominio debe estar verificado (SPF/DKIM) en el proveedor. |
+| `EMAIL_REPLY_TO` | — | A dónde van las respuestas a los correos masivos. |
+| `EMAIL_UNSUBSCRIBE_SECRET` | — | Firma los enlaces de baja (`openssl rand -hex 32`). **Secreta.** Si se cambia, los enlaces de correos ya enviados dejan de valer. |
+| `EMAIL_PUBLIC_BASE_URL` | URL de la petición | URL pública de este backend para el enlace de baja. |
+| `EMAIL_POSTAL_ADDRESS` | — | Dirección física para el pie (la exige CAN-SPAM si se escribe a EE. UU.). |
 
 ## Desarrollo
 
@@ -138,3 +151,35 @@ bash scripts/gcp/scheduler-cleanup.sh   # crea/actualiza el job diario (03:00 Bo
 
 (los dos scripts viven en el repo del frontend, `scripts/gcp/`). El job se
 puede probar a mano con `bash scripts/gcp/scheduler-cleanup.sh --run`.
+
+## Correos masivos (`src/email`)
+
+Da servicio a la pestaña "Correos" del panel del dueño.
+
+- **Destinatarios**: colección `users` (`email`, `name`). Segmentos `all`,
+  `with_orders` (al menos un pedido en `paid`, `mock_paid`, `en_produccion`,
+  `enviado` o `entregado`, buscado con `collectionGroup('orders')` para cubrir
+  también los antiguos `users/{uid}/orders`) y `without_orders`. Se excluyen
+  `emailOptOut: true`, correos inválidos y duplicados.
+- **Proveedor**: interfaz `EmailProvider` (`email-provider.ts`); la única
+  implementación es Resend (`POST /emails/batch`, 100 correos por lote, 600 ms
+  entre lotes, un reintento en 429, `Idempotency-Key` por lote).
+- **Baja obligatoria** (Ley 1581 de 2012 / CAN-SPAM): cada correo lleva en el
+  pie un enlace `GET /email/unsubscribe?token=…` con un HMAC del uid y las
+  cabeceras `List-Unsubscribe` + `List-Unsubscribe-Post` (baja en un clic de
+  Gmail/Yahoo). El GET solo muestra un botón (los escáneres de enlaces no deben
+  dar de baja a nadie); el POST marca `users/{uid}.emailOptOut = true`.
+- **Historial**: `email_campaigns/{campaignId}` con asunto, cuerpo, segmento,
+  destinatarios, enviados/fallidos (hasta 50 fallos con su error), autor y
+  fechas. El `campaignId` lo genera el panel: repetir la petición devuelve 409
+  en vez de enviar dos veces.
+- El envío es síncrono (la petición vuelve al terminar el último lote).
+
+### Antes de enviar de verdad
+
+1. Verificar el dominio remitente en Resend (registros SPF, DKIM y, mejor, DMARC
+   en el DNS de `jiffyphotos.com`).
+2. Instalar las variables (los secretos, idealmente en Secret Manager):
+   `EMAIL_PROVIDER_API_KEY`, `EMAIL_FROM`, `EMAIL_UNSUBSCRIBE_SECRET` y, si se
+   quiere, `EMAIL_REPLY_TO`, `EMAIL_POSTAL_ADDRESS`, `EMAIL_PUBLIC_BASE_URL`.
+3. Desplegar y mandar un envío de prueba desde el panel.
