@@ -2,6 +2,15 @@ import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import * as admin from 'firebase-admin';
 import { getFirestore } from '../firebase/firebase-admin';
 import { DRAFT_STATUSES, StoragePolicy, readStoragePolicy } from './storage-policy';
+import {
+  BucketFile,
+  LOOSE_GRACE_MS,
+  LooseFolder,
+  LooseScan,
+  SkippedFolder,
+  findLooseFiles,
+  referencedFiles,
+} from './loose-files';
 
 /**
  * Gestión de almacenamiento: cuánto ocupa el bucket, quién lo consume y
@@ -87,6 +96,18 @@ export interface StorageStats {
   topProjects: ProjectUsage[];
   topUsers: UserUsage[];
   orphans: ProjectUsage[];
+  /**
+   * Fotos sueltas dentro de carpetas de pedidos vivos (ver loose-files.ts). Sus
+   * bytes ya cuentan dentro de borradores/pedidos del desglose: es un "de los
+   * cuales", no se suma al total. Las rutas no viajan aquí, solo en la limpieza.
+   */
+  looseFiles: {
+    files: number;
+    bytes: number;
+    graceDays: number;
+    items: LooseFolder[];
+    skipped: SkippedFolder[];
+  };
   lastCleanup: CleanupSummary | null;
 }
 
@@ -94,6 +115,7 @@ export interface CleanupOptions {
   dryRun: boolean;
   expiredDrafts: boolean;
   orphans: boolean;
+  looseFiles: boolean;
   trigger: 'panel' | 'scheduler';
 }
 
@@ -106,12 +128,15 @@ export interface CleanupSummary {
   appliesFrom: string | null;
   expiredDrafts: { count: number; bytes: number };
   orphans: { count: number; bytes: number };
+  /** `count` = archivos. Ausente en resúmenes anteriores a esta opción. */
+  looseFiles?: { count: number; bytes: number };
   errors: string[];
 }
 
 export interface CleanupResult extends CleanupSummary {
   expiredDrafts: { count: number; bytes: number; items: ProjectUsage[] };
   orphans: { count: number; bytes: number; items: ProjectUsage[] };
+  looseFiles: { count: number; bytes: number; items: LooseFolder[]; skipped: SkippedFolder[] };
 }
 
 const STORAGE_STATUS_DOC = 'settings/storage_status';
@@ -124,6 +149,8 @@ const TOP_N = 10;
  */
 const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
 const PAGE_SIZE = 1000;
+/** Borrados en paralelo al limpiar fotos sueltas. */
+const DELETE_CONCURRENCY = 16;
 
 interface OrderMeta {
   userId: string | null;
@@ -145,6 +172,8 @@ type StorageBucket = ReturnType<admin.storage.Storage['bucket']>;
 @Injectable()
 export class StorageService {
   private cache: { stats: StorageStats; at: number } | null = null;
+  /** Barrido de fotos sueltas del último cálculo, CON rutas (las necesita la limpieza). */
+  private looseScan: LooseScan | null = null;
   private inFlight: Promise<StorageStats> | null = null;
 
   async getStats(refresh = false): Promise<StorageStats> {
@@ -180,13 +209,14 @@ export class StorageService {
 
   private async computeStats(): Promise<StorageStats> {
     const bucket = this.resolveBucket();
-    const [policy, { orders, referenced }, users] = await Promise.all([
+    const [policy, { orders, referenced, referencedPaths }, users] = await Promise.all([
       readStoragePolicy(),
       this.loadOrders(),
       this.loadUsers(),
     ]);
 
     const folders = new Map<string, FolderUsage>(); // `${uid}/${orderId}`
+    const folderFiles = new Map<string, BucketFile[]>();
     const systemImages: Usage = { bytes: 0, files: 0 };
     const other: Usage = { bytes: 0, files: 0 };
 
@@ -208,6 +238,9 @@ export class StorageService {
           folder.files += 1;
           folder.lastFileMs = Math.max(folder.lastFileMs, updatedMs);
           folders.set(key, folder);
+          const list = folderFiles.get(key) ?? [];
+          list.push({ path: file.name, bytes: size, updatedMs });
+          folderFiles.set(key, list);
         } else if (parts[0] === 'system_images') {
           systemImages.bytes += size;
           systemImages.files += 1;
@@ -320,6 +353,22 @@ export class StorageService {
       byUser.set(project.userId, usage);
     }
 
+    // Fotos sueltas: solo dentro de carpetas que NO son huérfanas (mismo criterio
+    // que arriba); las huérfanas enteras ya las cubre su propia limpieza.
+    const live = new Map<string, { status: string | null; customerName: string | null; customerEmail: string | null }>();
+    for (const key of folders.keys()) {
+      const orderId = key.split('/')[1];
+      const sharedWith = referenced.get(key) ?? [];
+      if (!orders.has(orderId) && sharedWith.length === 0) continue;
+      const meta = orders.get(orderId) ?? orders.get(sharedWith[0]);
+      live.set(key, {
+        status: meta?.status ?? null,
+        customerName: meta?.customerName ?? null,
+        customerEmail: meta?.customerEmail ?? null,
+      });
+    }
+    const looseScan = findLooseFiles(folderFiles, live, referencedPaths, now);
+
     const totalBytes =
       drafts.bytes + paid.bytes + orphans.bytes + inProgress.bytes + systemImages.bytes + other.bytes;
     const totalFiles =
@@ -351,21 +400,36 @@ export class StorageService {
         .slice(0, TOP_N),
       topUsers: [...byUser.values()].sort((a, b) => b.bytes - a.bytes).slice(0, TOP_N),
       orphans: orphanList.sort((a, b) => b.bytes - a.bytes),
+      looseFiles: {
+        files: looseScan.folders.reduce((sum, f) => sum + f.files, 0),
+        bytes: looseScan.folders.reduce((sum, f) => sum + f.bytes, 0),
+        graceDays: LOOSE_GRACE_MS / (24 * 60 * 60 * 1000),
+        items: looseScan.folders.map(({ paths: _paths, ...rest }) => rest),
+        skipped: looseScan.skipped,
+      },
       lastCleanup: await this.readLastCleanup(),
     };
 
     this.cache = { stats, at: now };
+    this.looseScan = looseScan;
     return stats;
   }
 
-  private async loadOrders(): Promise<{ orders: Map<string, OrderMeta>; referenced: Map<string, string[]> }> {
+  private async loadOrders(): Promise<{
+    orders: Map<string, OrderMeta>;
+    referenced: Map<string, string[]>;
+    /** Todas las rutas de objeto que nombra algún pedido, sea cual sea su carpeta. */
+    referencedPaths: Set<string>;
+  }> {
     // Se traen los documentos enteros: hace falta recorrer sus URLs para saber
     // qué carpetas usa cada pedido, que no siempre es la que lleva su propio id.
     const snap = await getFirestore().collection('orders').get();
     const map = new Map<string, OrderMeta>();
     const referenced = new Map<string, string[]>();
+    const referencedPaths = new Set<string>();
     snap.forEach(doc => {
       const d = doc.data() as Record<string, any>;
+      for (const path of referencedFiles(d)) referencedPaths.add(path);
       for (const key of referencedFolders(d)) {
         if (key.split('/')[1] === doc.id) continue;
         referenced.set(key, [...(referenced.get(key) ?? []), doc.id]);
@@ -382,7 +446,7 @@ export class StorageService {
         lastEditedAt: toIso(d.updatedAt) ?? createdAt,
       });
     });
-    return { orders: map, referenced };
+    return { orders: map, referenced, referencedPaths };
   }
 
   private async loadUsers(): Promise<Map<string, { name: string | null; email: string | null }>> {
@@ -444,6 +508,9 @@ export class StorageService {
     }
 
     const orphanItems = options.orphans ? stats.orphans : [];
+    // `getStats(true)` acaba de recorrer el bucket y releer todos los pedidos:
+    // el barrido es de este mismo instante, no del caché.
+    const looseScan: LooseScan = options.looseFiles && this.looseScan ? this.looseScan : { folders: [], skipped: [] };
 
     if (!options.dryRun) {
       const db = getFirestore();
@@ -469,7 +536,23 @@ export class StorageService {
           errors.push(`carpeta ${item.userId}/${item.orderId}: ${error?.message ?? error}`);
         }
       }
+      const loosePaths = looseScan.folders.flatMap(f => f.paths ?? []);
+      for (let i = 0; i < loosePaths.length; i += DELETE_CONCURRENCY) {
+        await Promise.all(
+          loosePaths.slice(i, i + DELETE_CONCURRENCY).map(async path => {
+            try {
+              // Puede haber caído ya con la carpeta de un borrador vencido.
+              await bucket.file(path).delete({ ignoreNotFound: true });
+            } catch (error: any) {
+              errors.push(`foto suelta ${path}: ${error?.message ?? error}`);
+            }
+          }),
+        );
+      }
     }
+
+    const looseCount = looseScan.folders.reduce((sum, f) => sum + f.files, 0);
+    const looseBytes = looseScan.folders.reduce((sum, f) => sum + f.bytes, 0);
 
     const result: CleanupResult = {
       at: new Date().toISOString(),
@@ -488,6 +571,12 @@ export class StorageService {
         bytes: orphanItems.reduce((sum, p) => sum + p.bytes, 0),
         items: orphanItems,
       },
+      looseFiles: {
+        count: looseCount,
+        bytes: looseBytes,
+        items: looseScan.folders,
+        skipped: looseScan.skipped,
+      },
       errors,
     };
 
@@ -499,11 +588,13 @@ export class StorageService {
         ...result,
         expiredDrafts: { count: result.expiredDrafts.count, bytes: result.expiredDrafts.bytes },
         orphans: { count: result.orphans.count, bytes: result.orphans.bytes },
+        looseFiles: { count: looseCount, bytes: looseBytes },
       };
       await getFirestore().doc(STORAGE_STATUS_DOC).set({ lastCleanup: summary }, { merge: true });
       console.log(
-        `[storage] Limpieza (${options.trigger}): ${result.expiredDrafts.count} borradores y ` +
-          `${result.orphans.count} carpetas huérfanas, ${result.expiredDrafts.bytes + result.orphans.bytes} bytes` +
+        `[storage] Limpieza (${options.trigger}): ${result.expiredDrafts.count} borradores, ` +
+          `${result.orphans.count} carpetas huérfanas y ${looseCount} fotos sueltas, ` +
+          `${result.expiredDrafts.bytes + result.orphans.bytes + looseBytes} bytes` +
           (errors.length ? `, ${errors.length} errores` : ''),
       );
     }
