@@ -57,11 +57,52 @@ export function htmlToText(html: string): string {
     .trim();
 }
 
+/**
+ * Imagen en el formato «Texto»: una línea sola con `![descripción](https://…)`
+ * (lo que inserta el botón «Imagen» del panel). Solo https: el correo se abre
+ * en clientes que bloquean http y otros esquemas.
+ */
+export const IMAGE_LINE = /^\s*!\[([^\]\n]*)\]\((https:\/\/[^\s)]+)\)\s*$/;
+
+export function imageHtml(url: string, alt: string): string {
+  return `<img src="${escapeHtml(url)}" alt="${escapeHtml(alt)}" width="536" style="display:block;width:100%;max-width:536px;height:auto;border:0;border-radius:8px;margin:0 0 16px">`;
+}
+
 function textToHtml(text: string): string {
   return text
     .split(/\n{2,}/)
-    .map(paragraph => `<p style="margin:0 0 16px">${escapeHtml(paragraph).replace(/\n/g, '<br>')}</p>`)
+    .map(paragraph => {
+      // Las líneas de imagen se sacan del párrafo: un <img> dentro de <p> con
+      // margen se ve distinto en cada cliente de correo.
+      const parts: string[] = [];
+      let lines: string[] = [];
+      const flush = () => {
+        if (lines.join('').trim()) {
+          parts.push(`<p style="margin:0 0 16px">${lines.map(escapeHtml).join('<br>')}</p>`);
+        }
+        lines = [];
+      };
+      for (const line of paragraph.split('\n')) {
+        const image = line.match(IMAGE_LINE);
+        if (image) { flush(); parts.push(imageHtml(image[2], image[1])); } else lines.push(line);
+      }
+      flush();
+      return parts.join('');
+    })
     .join('');
+}
+
+/** Parte text/plain: las imágenes no se ven, queda su descripción si la hay. */
+function textWithoutImages(text: string): string {
+  return text
+    .split('\n')
+    .map(line => {
+      const image = line.match(IMAGE_LINE);
+      return image ? (image[1].trim() ? `[${image[1].trim()}]` : null) : line;
+    })
+    .filter((line): line is string => line !== null)
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n');
 }
 
 export function renderEmail(input: RenderInput): RenderedEmail {
@@ -77,7 +118,7 @@ export function renderEmail(input: RenderInput): RenderedEmail {
     : textToHtml(input.body.replace(NAME_PLACEHOLDER, name));
   const contentText = input.format === 'html'
     ? htmlToText(input.body.replace(NAME_PLACEHOLDER, name))
-    : input.body.replace(NAME_PLACEHOLDER, name).trim();
+    : textWithoutImages(input.body.replace(NAME_PLACEHOLDER, name)).trim();
 
   const unsubscribeUrl = escapeHtml(input.unsubscribeUrl);
   const postal = input.postalAddress ? escapeHtml(input.postalAddress) : '';

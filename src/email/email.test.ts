@@ -58,6 +58,26 @@ describe('renderEmail', () => {
     assert.match(r.text, /Calle 1 # 2-3, Bogotá/);
   });
 
+  it('texto: una línea ![…](https://…) es una imagen, fuera del párrafo', () => {
+    const body = 'Hola {{nombre}}\n![Álbum "nuevo"](https://firebasestorage.googleapis.com/v0/b/x/o/email_images%2Fa.jpg?alt=media&token=1)\nMira esto';
+    const r = renderEmail({ ...base, subject: 's', body, format: 'text' });
+    assert.match(r.html, /<p style="margin:0 0 16px">Hola Ana<\/p><img src="https:\/\/firebasestorage\.googleapis\.com\/v0\/b\/x\/o\/email_images%2Fa\.jpg\?alt=media&amp;token=1" alt="Álbum &quot;nuevo&quot;"/);
+    assert.match(r.html, /<p style="margin:0 0 16px">Mira esto<\/p>/);
+    assert.equal(r.text.split('\n—')[0], 'Hola Ana\n[Álbum "nuevo"]\nMira esto\n');
+  });
+
+  it('texto: solo imágenes https y en su propia línea; lo demás queda como texto', () => {
+    const r = renderEmail({ ...base, subject: 's', body: '![x](http://a.co/i.jpg)\n![y](javascript:alert(1))\nver ![z](https://a.co/i.jpg) aquí', format: 'text' });
+    assert.doesNotMatch(r.html, /<img/);
+    assert.match(r.html, /!\[x\]\(http:\/\/a\.co\/i\.jpg\)/);
+  });
+
+  it('texto: una imagen sin descripción no deja rastro en la parte text/plain', () => {
+    const r = renderEmail({ ...base, subject: 's', body: 'Uno\n\n![](https://a.co/i.jpg)\n\nDos', format: 'text' });
+    assert.match(r.html, /<img src="https:\/\/a\.co\/i\.jpg" alt=""/);
+    assert.equal(r.text.split('\n—')[0], 'Uno\n\nDos\n');
+  });
+
   it('htmlToText conserva enlaces y saltos', () => {
     assert.equal(htmlToText('<p>Uno</p><p>Mira <a href="https://x.co">esto</a></p>'), 'Uno\nMira esto (https://x.co)');
   });
