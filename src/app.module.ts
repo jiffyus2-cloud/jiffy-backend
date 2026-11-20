@@ -6,6 +6,7 @@ import { DiscountsModule } from './discounts/discounts.module';
 import { OneclicModule } from './oneclic/oneclic.module';
 import { StorageModule } from './storage/storage.module';
 import { EmailModule } from './email/email.module';
+import { NequiModule } from './nequi/nequi.module';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { EmailModule } from './email/email.module';
     OneclicModule, // Conexión con 1clic.ai (aislado: se puede quitar sin tocar nada más)
     StorageModule, // Gestión de almacenamiento (uso del bucket y limpieza de borradores)
     EmailModule, // Correos masivos a usuarios registrados (pestaña Correos) y baja pública
+    NequiModule, // Cobro con Nequi (pagos push); apagado si faltan credenciales
   ],
   controllers: [AppController],
   providers: [],
