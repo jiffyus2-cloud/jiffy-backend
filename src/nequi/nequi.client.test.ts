@@ -2,6 +2,8 @@ import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
   NequiApiError,
+  NequiAuthError,
+  isAmbiguousSendFailure,
   NequiClient,
   NequiNotConfiguredError,
   mapNequiStatus,
@@ -158,5 +160,47 @@ describe('NequiClient', () => {
     const client = new NequiClient(readNequiConfig(ENV), f.impl);
     await assert.rejects(client.getPaymentStatus('tx'), NequiApiError);
     assert.equal(f.calls.length, 1);
+  });
+});
+
+describe('reversión', () => {
+  it('reversa con el MessageID del cobro original, el celular y el valor', async () => {
+    const f = fakeFetch([TOKEN(), ok({ reversionRS: '' })]);
+    const client = new NequiClient(readNequiConfig(ENV), f.impl);
+    await client.reverseTransaction({ phoneNumber: '3001234567', value: 152000.2, messageId: 'abc123def0' });
+
+    const call = f.calls[1];
+    assert.equal(call.url, 'https://api.sandbox.nequi.com/payments/v2/-services-reverseservices-reversetransaction');
+    const body = JSON.parse(String(call.init!.body));
+    assert.equal(body.RequestMessage.RequestHeader.Destination.ServiceName, 'ReverseServices');
+    assert.equal(body.RequestMessage.RequestHeader.Destination.ServiceOperation, 'reverseTransaction');
+    assert.deepEqual(body.RequestMessage.RequestBody.any, {
+      reversionRQ: { phoneNumber: '3001234567', value: '152000', code: 'NIT_1', messageId: 'abc123def0', type: 'payment' },
+    });
+  });
+
+  it('el cobro usa el MessageID que se le pasa (para poder reversarlo luego)', async () => {
+    const f = fakeFetch([TOKEN(), ok({ unregisteredPaymentRS: { transactionId: 'tx' } })]);
+    const client = new NequiClient(readNequiConfig(ENV), f.impl);
+    const res = await client.sendPushPayment({ phoneNumber: '3001234567', value: 1000, messageId: 'fixed00001' });
+    assert.equal(res.messageId, 'fixed00001');
+    assert.equal(JSON.parse(String(f.calls[1].init!.body)).RequestMessage.RequestHeader.MessageID, 'fixed00001');
+  });
+
+  it('solo se reversa automáticamente cuando el resultado del envío es dudoso', () => {
+    assert.equal(isAmbiguousSendFailure(new TypeError('fetch failed')), true); // red
+    assert.equal(isAmbiguousSendFailure(Object.assign(new Error('t'), { name: 'TimeoutError' })), true);
+    assert.equal(isAmbiguousSendFailure(new NequiApiError('HTTP 502', null, 502)), true);
+    assert.equal(isAmbiguousSendFailure(new NequiApiError('sin transactionId', null, null)), true);
+    assert.equal(isAmbiguousSendFailure(new NequiApiError('no tiene Nequi', '20-07A', 200)), false);
+    assert.equal(isAmbiguousSendFailure(new NequiApiError('HTTP 400', null, 400)), false);
+    assert.equal(isAmbiguousSendFailure(new NequiAuthError('token', null, 401)), false);
+    assert.equal(isAmbiguousSendFailure(new NequiNotConfiguredError()), false);
+  });
+
+  it('un fallo del token es NequiAuthError (nada llegó a Nequi)', async () => {
+    const f = fakeFetch([jsonResponse(401, {})]);
+    const client = new NequiClient(readNequiConfig(ENV), f.impl);
+    await assert.rejects(client.sendPushPayment({ phoneNumber: '3001234567', value: 1 }), NequiAuthError);
   });
 });

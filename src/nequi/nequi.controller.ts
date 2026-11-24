@@ -4,6 +4,7 @@ import {
 import { timingSafeEqual } from 'node:crypto';
 import { Request } from 'express';
 import { FirebaseAuthGuard } from '../middleware/firebase-auth.guard';
+import { OwnerGuard } from '../middleware/owner.guard';
 import { readNequiConfig } from './nequi.config';
 import { NequiService } from './nequi.service';
 
@@ -43,6 +44,17 @@ export class NequiController {
   @UseGuards(FirebaseAuthGuard)
   cancel(@Body() body: { orderId?: string }, @Req() req: AuthedRequest) {
     return this.nequi.cancel({ orderId: String(body?.orderId ?? ''), uid: req.user!.uid });
+  }
+
+  /** Solo el dueño: devuelve al cliente un pago Nequi ya cobrado (pedido en "Pagado"). */
+  @Post('reverse')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(OwnerGuard)
+  reverse(@Body() body: { orderId?: string }, @Req() req: Request & { user?: { email?: string } }) {
+    return this.nequi.reversePayment({
+      orderId: String(body?.orderId ?? ''),
+      ownerEmail: String(req.user?.email ?? ''),
+    });
   }
 
   /**
