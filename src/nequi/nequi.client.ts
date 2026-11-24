@@ -22,6 +22,7 @@ export const NEQUI_ENDPOINTS = {
   unregisteredPayment: '/payments/v2/-services-paymentservice-unregisteredpayment',
   getStatusPayment: '/payments/v2/-services-paymentservice-getstatuspayment',
   cancelUnregisteredPayment: '/payments/v2/-services-paymentservice-cancelunregisteredpayment',
+  reverseTransaction: '/payments/v2/-services-reverseservices-reversetransaction',
 } as const;
 
 /** Canal de pagos push en Nequi Conecta. */
@@ -37,7 +38,7 @@ export const NEQUI_PAYMENT_STATUS = {
 } as const;
 
 /** Estado de un cobro Nequi tal como lo guardamos en el pedido. */
-export type NequiPaymentState = 'pending' | 'paid' | 'rejected' | 'expired' | 'failed' | 'cancelled';
+export type NequiPaymentState = 'pending' | 'paid' | 'rejected' | 'expired' | 'failed' | 'cancelled' | 'reversed';
 
 export function mapNequiStatus(status: string | undefined | null): NequiPaymentState {
   switch (String(status ?? '').trim()) {
@@ -85,6 +86,25 @@ export class NequiApiError extends Error {
   }
 }
 
+/** El token no se pudo obtener: la petición de negocio ni siquiera salió. */
+export class NequiAuthError extends NequiApiError {}
+
+/**
+ * ¿Pudo Nequi haber procesado el cobro aunque no sepamos el resultado? Sí si la
+ * red falló o se agotó el tiempo, si Nequi respondió 5xx, o si aceptó sin
+ * devolver transactionId. No si el token falló (no salió nada), si Nequi
+ * rechazó con un StatusCode de negocio o con un 4xx.
+ */
+export function isAmbiguousSendFailure(err: unknown): boolean {
+  if (err instanceof NequiNotConfiguredError || err instanceof NequiAuthError) return false;
+  if (err instanceof NequiApiError) {
+    if (err.statusCode) return false;
+    if (err.httpStatus != null && err.httpStatus < 500) return false;
+    return true;
+  }
+  return true;
+}
+
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
 interface CachedToken {
@@ -111,13 +131,21 @@ export class NequiClient {
     return isNequiConfigured(this.config);
   }
 
-  /** Envía la notificación push. Devuelve el transactionId de Nequi. */
+  /**
+   * Envía la notificación push. Devuelve el transactionId de Nequi.
+   *
+   * `messageId` es el MessageID de la petición. Se puede fijar desde fuera
+   * porque la reversión (`reverseTransaction`) identifica el cobro por ese
+   * MessageID: quien llama tiene que conocerlo aunque la petición falle sin
+   * respuesta, que es justo el caso en que Nequi pide reversar.
+   */
   async sendPushPayment(params: {
     phoneNumber: string;
     value: number;
     reference1?: string;
     reference2?: string;
     reference3?: string;
+    messageId?: string;
   }): Promise<{ transactionId: string; messageId: string }> {
     const rq: Record<string, string> = {
       phoneNumber: params.phoneNumber,
@@ -133,6 +161,7 @@ export class NequiClient {
       NEQUI_ENDPOINTS.unregisteredPayment,
       { ServiceName: 'PaymentsService', ServiceOperation: 'unregisteredPayment', ServiceRegion: 'C001', ServiceVersion: '1.2.0' },
       { unregisteredPaymentRQ: rq },
+      params.messageId,
     );
 
     const transactionId = body?.unregisteredPaymentRS?.transactionId;
@@ -181,17 +210,40 @@ export class NequiClient {
     );
   }
 
+  /**
+   * Reversa un cobro push: devuelve la plata al cliente si ya pagó, o deja sin
+   * efecto un cobro cuya respuesta nunca llegó. Nequi lo identifica por el
+   * MessageID de la petición `unregisteredPayment` original, el celular y el
+   * valor. `type` es "payment" para pagos push.
+   */
+  async reverseTransaction(params: { phoneNumber: string; value: number; messageId: string }): Promise<void> {
+    await this.call(
+      NEQUI_ENDPOINTS.reverseTransaction,
+      { ServiceName: 'ReverseServices', ServiceOperation: 'reverseTransaction', ServiceRegion: 'C001', ServiceVersion: '1.0.0' },
+      {
+        reversionRQ: {
+          phoneNumber: params.phoneNumber,
+          value: String(Math.round(params.value)),
+          code: this.config.commerceCode!,
+          messageId: params.messageId,
+          type: 'payment',
+        },
+      },
+    );
+  }
+
   // ---------------------------------------------------------------------------
 
   private async call(
     path: string,
     destination: Record<string, string>,
     requestBody: Record<string, unknown>,
+    fixedMessageId?: string,
   ): Promise<{ body: any; messageId: string }> {
     if (!this.configured) throw new NequiNotConfiguredError();
 
     const token = await this.getToken();
-    const messageId = generateMessageId();
+    const messageId = fixedMessageId || generateMessageId();
     const payload = {
       RequestMessage: {
         RequestHeader: {
@@ -266,7 +318,7 @@ export class NequiClient {
     const json: any = await res.json().catch(() => null);
     if (!res.ok || typeof json?.access_token !== 'string') {
       this.token = null;
-      throw new NequiApiError(
+      throw new NequiAuthError(
         `No se pudo autenticar con Nequi (HTTP ${res.status}). Revisa NEQUI_CLIENT_ID / NEQUI_CLIENT_SECRET.`,
         null,
         res.status,

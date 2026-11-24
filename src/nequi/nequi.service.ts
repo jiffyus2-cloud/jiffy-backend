@@ -7,6 +7,8 @@ import {
   NequiClient,
   NequiNotConfiguredError,
   NequiPaymentState,
+  generateMessageId,
+  isAmbiguousSendFailure,
   normalizeNequiPhone,
 } from './nequi.client';
 
@@ -34,6 +36,13 @@ export interface NequiPaymentRecord {
   orderId: string;
   userId: string;
   transactionId: string;
+  /**
+   * MessageID de la petición `unregisteredPayment`: es lo que identifica el
+   * cobro al reversarlo. Los registros anteriores a la reversión no lo tienen.
+   */
+  messageId?: string | null;
+  reversedAt?: string | null;
+  reversedBy?: string | null;
   /** Completo porque `cancelUnregisteredPayment` lo pide; al navegador sale enmascarado. */
   phoneNumber: string;
   value: number;
@@ -139,6 +148,9 @@ export class NequiService {
       }
     }
 
+    // El MessageID se fija antes de enviar: si la respuesta no llega, es lo
+    // único con lo que se puede reversar un cobro que Nequi sí procesó.
+    const messageId = generateMessageId();
     let transactionId: string;
     try {
       ({ transactionId } = await this.client.sendPushPayment({
@@ -146,8 +158,23 @@ export class NequiService {
         value: total,
         reference1: params.orderId,
         reference2: 'Jiffy Photos',
+        messageId,
       }));
     } catch (err) {
+      if (isAmbiguousSendFailure(err)) {
+        // Sin respuesta clara no sabemos si al cliente le llegó (o si ya
+        // pagó) un cobro del que no tenemos transactionId. Nequi pide
+        // reversarlo para que no quede un pago huérfano.
+        try {
+          await this.client.reverseTransaction({ phoneNumber, value: total, messageId });
+          this.logger.warn(`Cobro sin respuesta del pedido ${params.orderId} reversado (MessageID ${messageId}).`);
+        } catch (revErr) {
+          this.logger.error(
+            `⚠️ Cobro sin respuesta del pedido ${params.orderId} y la reversión falló ` +
+            `(MessageID ${messageId}, celular ${maskPhone(phoneNumber)}, ${total} COP): ${describe(revErr)}. Revisar a mano.`,
+          );
+        }
+      }
       throw this.toHttp(err, 'No pudimos enviar el cobro a tu Nequi.');
     }
 
@@ -156,6 +183,7 @@ export class NequiService {
       orderId: params.orderId,
       userId: params.uid,
       transactionId,
+      messageId,
       phoneNumber,
       value: total,
       state: 'pending',
@@ -203,6 +231,72 @@ export class NequiService {
     const now = new Date().toISOString();
     await this.closeRecord(params.orderId, 'cancelled', rec.rawStatus, now);
     return toView({ ...rec, state: 'cancelled', updatedAt: now }, order.status);
+  }
+
+  /**
+   * Reversa (devuelve) un pago Nequi ya cobrado. Solo el dueño de la tienda,
+   * desde el panel, y solo mientras el pedido sigue en "pagado": si ya está en
+   * producción, primero hay que sacarlo de ahí a propósito.
+   *
+   * El pedido vuelve a "pending_payment": la plata se devolvió, así que el
+   * pedido ya no está pagado. El canje del código de descuento no se descuenta
+   * (redeem() es idempotente por pedido, así que si vuelve a pagar no se cuenta
+   * dos veces).
+   */
+  async reversePayment(params: { orderId: string; ownerEmail: string }): Promise<NequiPaymentView> {
+    this.assertConfigured();
+    const { orderId } = params;
+    if (typeof orderId !== 'string' || orderId.trim() === '') {
+      throw new HttpException('Falta orderId', HttpStatus.BAD_REQUEST);
+    }
+    const db = getFirestore();
+    const orderRef = db.collection('orders').doc(orderId);
+    const [orderSnap, rec] = await Promise.all([orderRef.get(), this.loadRecord(orderId)]);
+    if (!orderSnap.exists) throw new HttpException('El pedido no existe', HttpStatus.NOT_FOUND);
+    const order = orderSnap.data() as any;
+
+    if (!rec) throw new HttpException('Este pedido no se pagó con Nequi', HttpStatus.NOT_FOUND);
+    if (rec.state === 'reversed') return toView(rec, order.status);
+    if (rec.state !== 'paid') {
+      throw new HttpException(`El cobro de Nequi está "${rec.state}", no "paid": no hay nada que reversar.`, HttpStatus.CONFLICT);
+    }
+    if (order.status !== 'paid') {
+      throw new HttpException(
+        `El pedido está en "${order.status}". Solo se reversan pedidos en "Pagado".`,
+        HttpStatus.CONFLICT,
+      );
+    }
+    if (!rec.messageId) {
+      throw new HttpException(
+        'Este cobro es anterior a la reversión automática y no guardó su MessageID: hay que reversarlo desde el portal de Nequi Negocios.',
+        HttpStatus.CONFLICT,
+      );
+    }
+
+    try {
+      await this.client.reverseTransaction({ phoneNumber: rec.phoneNumber, value: rec.value, messageId: rec.messageId });
+    } catch (err) {
+      throw this.toHttp(err, 'Nequi no aceptó la reversión.');
+    }
+
+    const now = new Date().toISOString();
+    await db.runTransaction(async tx => {
+      const fresh = (await tx.get(orderRef)).data() as any;
+      tx.update(db.collection(PAYMENTS).doc(orderId), {
+        state: 'reversed',
+        reversedAt: now,
+        reversedBy: params.ownerEmail,
+        updatedAt: now,
+      });
+      tx.update(orderRef, {
+        // Si mientras tanto alguien lo movió de "paid", no se le cambia el estado.
+        ...(fresh?.status === 'paid' ? { status: 'pending_payment' } : {}),
+        nequiState: 'reversed',
+        updatedAt: now,
+      });
+    });
+    this.logger.log(`↩️ Pago Nequi del pedido ${orderId} reversado por ${params.ownerEmail} (${rec.value} COP).`);
+    return toView({ ...rec, state: 'reversed', updatedAt: now }, 'pending_payment');
   }
 
   /**
