@@ -2,6 +2,7 @@ import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 import Stripe from 'stripe';
 import { getFirestore } from '../firebase/firebase-admin';
 import { DiscountsService } from '../discounts/discounts.service';
+import { OrderEmailService } from '../email/order-email.service';
 
 /**
  * Estados en los que un pedido NO se puede volver a cobrar.
@@ -22,7 +23,10 @@ const NON_PAYABLE_STATUSES = new Set([
 export class StripeService {
   private stripe: Stripe;
 
-  constructor(private readonly discountsService: DiscountsService) {
+  constructor(
+    private readonly discountsService: DiscountsService,
+    private readonly orderEmails: OrderEmailService,
+  ) {
     const stripeKey = process.env.STRIPE_SECRET_KEY || process.env.VITE_STRIPE_SECRET_KEY;
 
     // Antes había un fallback a 'sk_test_fallback': el servicio arrancaba con una
@@ -169,6 +173,10 @@ export class StripeService {
           });
 
           console.log(`✅ ¡Éxito! Pedido ${orderId} actualizado a 'paid' vía Webhook.`);
+
+          // Correo de confirmación de compra (si el dueño lo activó). notify() no
+          // lanza y es idempotente: los reintentos de Stripe no lo duplican.
+          await this.orderEmails.notify(orderId, 'paid');
 
           // El canje del código se cuenta AQUÍ, no cuando el cliente lo escribe:
           // así un código no se gasta por abandonar el checkout y nadie puede

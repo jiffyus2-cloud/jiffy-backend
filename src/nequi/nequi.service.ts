@@ -1,6 +1,7 @@
 import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { getFirestore } from '../firebase/firebase-admin';
 import { DiscountsService } from '../discounts/discounts.service';
+import { OrderEmailService } from '../email/order-email.service';
 import { readNequiConfig } from './nequi.config';
 import {
   NequiApiError,
@@ -75,7 +76,10 @@ export class NequiService {
   /** Última consulta a Nequi por pedido (memoria del proceso; basta como freno). */
   private readonly lastCheck = new Map<string, number>();
 
-  constructor(private readonly discountsService: DiscountsService) {
+  constructor(
+    private readonly discountsService: DiscountsService,
+    private readonly orderEmails: OrderEmailService,
+  ) {
     this.client = new NequiClient(this.config);
     this.logger.log(
       this.client.configured
@@ -393,6 +397,8 @@ export class NequiService {
 
     if (firstTime) {
       this.logger.log(`✅ Pedido ${orderId} pagado con Nequi (tx ${rec.transactionId}).`);
+      // Correo de confirmación de compra (si está activado; notify() no lanza).
+      await this.orderEmails.notify(orderId, 'paid');
       // Igual que en el webhook de Stripe: el canje se cuenta al confirmar el
       // pago. redeem() es idempotente por pedido.
       if (order.discountCode) {

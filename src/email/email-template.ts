@@ -13,7 +13,8 @@ export interface RenderInput {
   body: string;
   format: EmailBodyFormat;
   recipientName?: string;
-  unsubscribeUrl: string;
+  /** Enlace de baja (correos de campaña). Sin él, el pie es el de un aviso de pedido. */
+  unsubscribeUrl?: string;
   postalAddress?: string;
 }
 
@@ -120,8 +121,14 @@ export function renderEmail(input: RenderInput): RenderedEmail {
     ? htmlToText(input.body.replace(NAME_PLACEHOLDER, name))
     : textWithoutImages(input.body.replace(NAME_PLACEHOLDER, name)).trim();
 
-  const unsubscribeUrl = escapeHtml(input.unsubscribeUrl);
   const postal = input.postalAddress ? escapeHtml(input.postalAddress) : '';
+  const footerHtml = input.unsubscribeUrl
+    ? `Recibes este correo porque tienes una cuenta en Jiffy Photos (jiffyphotos.com).<br>
+          Si no quieres recibir más comunicaciones como esta, <a href="${escapeHtml(input.unsubscribeUrl)}" style="color:#78716c">date de baja aquí</a>.`
+    : 'Recibes este correo porque hiciste un pedido en Jiffy Photos (jiffyphotos.com).';
+  const footerText = input.unsubscribeUrl
+    ? ['Recibes este correo porque tienes una cuenta en Jiffy Photos (jiffyphotos.com).', `Para darte de baja: ${input.unsubscribeUrl}`]
+    : ['Recibes este correo porque hiciste un pedido en Jiffy Photos (jiffyphotos.com).'];
 
   const html = `<!doctype html>
 <html lang="es">
@@ -135,8 +142,7 @@ export function renderEmail(input: RenderInput): RenderedEmail {
       </table>
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px">
         <tr><td style="padding:16px 32px;font-size:12px;line-height:1.5;color:#78716c;text-align:center">
-          Recibes este correo porque tienes una cuenta en Jiffy Photos (jiffyphotos.com).<br>
-          Si no quieres recibir más comunicaciones como esta, <a href="${unsubscribeUrl}" style="color:#78716c">date de baja aquí</a>.
+          ${footerHtml}
           ${postal ? `<br>${postal}` : ''}
         </td></tr>
       </table>
@@ -149,8 +155,7 @@ export function renderEmail(input: RenderInput): RenderedEmail {
     contentText,
     '',
     '—',
-    'Recibes este correo porque tienes una cuenta en Jiffy Photos (jiffyphotos.com).',
-    `Para darte de baja: ${input.unsubscribeUrl}`,
+    ...footerText,
     ...(input.postalAddress ? [input.postalAddress] : []),
   ].join('\n');
 

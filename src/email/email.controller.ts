@@ -1,7 +1,8 @@
-import { Body, Controller, Get, HttpCode, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, HttpCode, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { OwnerGuard } from '../middleware/owner.guard';
 import { escapeHtml } from './email-template';
 import { EmailService } from './email.service';
+import { OrderEmailService } from './order-email.service';
 
 /** URL pública con la que nos han llamado (Cloud Run termina TLS delante). */
 function requestBaseUrl(req: any): string {
@@ -13,7 +14,10 @@ function requestBaseUrl(req: any): string {
 @Controller('email')
 @UseGuards(OwnerGuard)
 export class EmailController {
-  constructor(private readonly emailService: EmailService) {}
+  constructor(
+    private readonly emailService: EmailService,
+    private readonly orderEmails: OrderEmailService,
+  ) {}
 
   /** Qué falta configurar (nombres de variables, nunca valores). */
   @Get('status')
@@ -44,6 +48,39 @@ export class EmailController {
   @Get('campaigns')
   campaigns(@Query('limit') limit?: string) {
     return this.emailService.listCampaigns(Number(limit) || 50);
+  }
+
+  // ── Correos automáticos de pedido ──
+
+  /** El panel lo llama tras cambiar el estado de un pedido; envía el aviso si toca. */
+  @Post('automations/notify')
+  @HttpCode(200)
+  notifyOrder(@Body() body: { orderId?: string }) {
+    const orderId = String(body?.orderId || '').trim();
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(orderId)) throw new BadRequestException('orderId no válido.');
+    return this.orderEmails.notify(orderId);
+  }
+
+  @Get('automations')
+  automations() {
+    return this.orderEmails.listTemplates();
+  }
+
+  @Post('automations/preview')
+  @HttpCode(200)
+  previewAutomation(@Body() body: unknown) {
+    return this.orderEmails.preview(body);
+  }
+
+  @Post('automations/test')
+  @HttpCode(200)
+  testAutomation(@Body() body: unknown) {
+    return this.orderEmails.sendTest(body);
+  }
+
+  @Get('automations/log')
+  automationLog(@Query('limit') limit?: string) {
+    return this.orderEmails.listLog(Number(limit) || 50);
   }
 
   @Post('campaigns')
