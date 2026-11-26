@@ -7,6 +7,7 @@ import { FirebaseAuthGuard } from '../middleware/firebase-auth.guard';
 import { OwnerGuard } from '../middleware/owner.guard';
 import { readNequiConfig } from './nequi.config';
 import { NequiService } from './nequi.service';
+import { CheckoutGroupError, parseOrderIds } from '../stripe/checkout-group';
 
 type AuthedRequest = Request & { user?: { uid: string } };
 
@@ -23,9 +24,17 @@ export class NequiController {
   /** Envía la notificación de cobro al celular Nequi del cliente. */
   @Post('create-payment')
   @UseGuards(FirebaseAuthGuard)
-  createPayment(@Body() body: { orderId?: string; phone?: string }, @Req() req: AuthedRequest) {
+  createPayment(@Body() body: { orderId?: string; orderIds?: string[]; phone?: string }, @Req() req: AuthedRequest) {
+    // `orderIds` (compra de varios productos) o `orderId` (pedido suelto, como siempre).
+    let orderIds: string[];
+    try {
+      orderIds = parseOrderIds(body);
+    } catch (err) {
+      if (err instanceof CheckoutGroupError) throw new HttpException(err.message, err.status);
+      throw err;
+    }
     return this.nequi.createPayment({
-      orderId: String(body?.orderId ?? ''),
+      orderIds,
       uid: req.user!.uid,
       phone: body?.phone,
     });

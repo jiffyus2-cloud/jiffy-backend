@@ -10,7 +10,7 @@ import {
   normalizeNequiPhone,
 } from './nequi.client';
 import { isNequiConfigured, readNequiConfig } from './nequi.config';
-import { maskPhone } from './nequi.service';
+import { maskPhone, nequiRecordKey, recordOrderIds } from './nequi.service';
 
 // Se ejecutan sobre el JS compilado (ver el script `test` de package.json).
 
@@ -202,5 +202,22 @@ describe('reversión', () => {
     const f = fakeFetch([jsonResponse(401, {})]);
     const client = new NequiClient(readNequiConfig(ENV), f.impl);
     await assert.rejects(client.sendPushPayment({ phoneNumber: '3001234567', value: 1 }), NequiAuthError);
+  });
+});
+
+describe('cobro de varios pedidos (carrito)', () => {
+  it('recordOrderIds: la lista de la compra, o solo el pedido en registros de uno', () => {
+    assert.deepEqual(recordOrderIds({ orderId: 'a', orderIds: ['a', 'b'] }), ['a', 'b']);
+    assert.deepEqual(recordOrderIds({ orderId: 'a' }), ['a']);
+    assert.deepEqual(recordOrderIds({ orderId: 'a', orderIds: [] }), ['a']);
+  });
+
+  it('nequiRecordKey: busca el cobro con el pedido principal de la compra', () => {
+    assert.equal(nequiRecordKey('b', { checkoutGroup: { leadOrderId: 'a' } }), 'a');
+    assert.equal(nequiRecordKey('b', {}), 'b');
+    assert.equal(nequiRecordKey('b', null), 'b');
+    // Un valor raro escrito por el cliente no sirve de ruta.
+    assert.equal(nequiRecordKey('b', { checkoutGroup: { leadOrderId: 'x/y' } }), 'b');
+    assert.equal(nequiRecordKey('b', { checkoutGroup: { leadOrderId: 42 } }), 'b');
   });
 });
