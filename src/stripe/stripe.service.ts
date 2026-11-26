@@ -1,23 +1,9 @@
-import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, HttpException } from '@nestjs/common';
 import Stripe from 'stripe';
 import { getFirestore } from '../firebase/firebase-admin';
 import { DiscountsService } from '../discounts/discounts.service';
 import { OrderEmailService } from '../email/order-email.service';
-
-/**
- * Estados en los que un pedido NO se puede volver a cobrar.
- *
- * Se usa lista negra y no lista blanca a propósito: si mañana aparece un estado
- * nuevo preferimos permitir el cobro (y detectarlo) antes que romper el checkout
- * de un cliente por un estado que no habíamos previsto.
- */
-const NON_PAYABLE_STATUSES = new Set([
-  'paid',
-  'mock_paid',
-  'en_produccion',
-  'enviado',
-  'entregado',
-]);
+import { CheckoutGroupError, orderIdsFromMetadata, validateGroup } from './checkout-group';
 
 @Injectable()
 export class StripeService {
@@ -49,87 +35,80 @@ export class StripeService {
   }
 
   /**
-   * Crea la sesión de pago de un pedido.
+   * Crea la sesión de pago de uno o varios pedidos (carrito).
    *
-   * El importe se lee del pedido en Firestore y NO del cuerpo de la petición.
-   * Antes se pasaba `orderDetails.amount` directamente a Stripe como
+   * El importe se lee de los pedidos en Firestore y NO del cuerpo de la
+   * petición. Antes se pasaba `orderDetails.amount` directamente a Stripe como
    * `unit_amount`, así que bastaba un POST con `amount: 100` para pagar 1 COP
    * por un álbum de 280.000.
+   *
+   * Con varios pedidos, cada uno es una línea en Stripe con su parte del total
+   * (el checkout ya repartió envío y descuentos) y todos deben pertenecer al
+   * mismo `checkoutGroup` (ver checkout-group.ts).
    *
    * `uid` viene de FirebaseAuthGuard, que ya validó el ID token.
    */
   async createCheckoutSession(params: {
-    orderId: string;
+    /** El primero es el pedido principal (lleva el envío y el código). */
+    orderIds: string[];
     uid: string;
     /** Importe que dice el cliente. Solo se usa para detectar discrepancias. */
     clientAmount?: number;
     /** Título que dice el cliente. Solo se usa como último recurso. */
     clientTitle?: string;
   }) {
-    const { orderId, uid, clientAmount, clientTitle } = params;
+    const { orderIds, uid, clientAmount, clientTitle } = params;
+    const db = getFirestore();
+    const snaps = await Promise.all(orderIds.map(id => db.collection('orders').doc(id).get()));
 
-    if (typeof orderId !== 'string' || orderId.trim() === '') {
-      throw new HttpException('Falta orderId', HttpStatus.BAD_REQUEST);
+    let group: ReturnType<typeof validateGroup>;
+    try {
+      group = validateGroup(orderIds, snaps.map(s => (s.exists ? s.data() : null)), uid);
+    } catch (err) {
+      if (err instanceof CheckoutGroupError) {
+        if (err.status === 403) {
+          console.warn(`[stripe] Usuario ${uid} intentó pagar pedidos ajenos: ${orderIds.join(', ')}.`);
+        }
+        throw new HttpException(err.message, err.status);
+      }
+      throw err;
     }
 
-    const snapshot = await getFirestore().collection('orders').doc(orderId).get();
-    if (!snapshot.exists) {
-      throw new HttpException('El pedido no existe', HttpStatus.NOT_FOUND);
-    }
-
-    const order = snapshot.data() as any;
-
-    // Solo puedes pagar tus propios pedidos.
-    if (order.userId !== uid) {
-      console.warn(`[stripe] Usuario ${uid} intentó pagar el pedido ${orderId} de ${order.userId}.`);
-      throw new HttpException('El pedido no te pertenece', HttpStatus.FORBIDDEN);
-    }
-
-    if (NON_PAYABLE_STATUSES.has(order.status)) {
-      throw new HttpException(
-        `El pedido ya está en estado "${order.status}" y no admite un nuevo pago`,
-        HttpStatus.CONFLICT
-      );
-    }
-
-    const total = Number(order.total);
-    if (!Number.isFinite(total) || total <= 0) {
-      throw new HttpException(
-        'El pedido no tiene un total válido. Vuelve al checkout y confirma la dirección.',
-        HttpStatus.BAD_REQUEST
-      );
-    }
-
-    // COP se cobra en unidades menores, igual que venía haciendo el frontend.
-    const unitAmount = Math.round(total * 100);
-
-    if (typeof clientAmount === 'number' && clientAmount !== unitAmount) {
+    if (typeof clientAmount === 'number' && clientAmount !== group.totalMinor) {
       // No es motivo de rechazo (el cliente puede ir un paso por detrás), pero
       // una discrepancia sistemática es señal de manipulación.
       console.warn(
-        `[stripe] Importe distinto en el pedido ${orderId}: cliente=${clientAmount}, ` +
-        `servidor=${unitAmount}. Se usa el del servidor.`
+        `[stripe] Importe distinto en ${orderIds.join(', ')}: cliente=${clientAmount}, ` +
+        `servidor=${group.totalMinor}. Se usa el del servidor.`
       );
     }
 
-    const title = order.product?.name || clientTitle || 'Pedido Jiffy';
     const frontendUrl = process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:5173';
+    const single = group.lines.length === 1;
+
+    // Una línea por pedido. Las de 0 (cubiertas por un descuento) no se listan:
+    // Stripe cobra igual el total de las demás.
+    const lineItems = group.lines
+      .filter(l => l.amountMinor > 0)
+      .map(l => ({
+        price_data: {
+          currency: 'cop',
+          product_data: { name: single && l.name === 'Pedido Jiffy' && clientTitle ? clientTitle : l.name },
+          unit_amount: l.amountMinor,
+        },
+        quantity: 1,
+      }));
 
     const session = await this.stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
-      line_items: [
-        {
-          price_data: {
-            currency: 'cop',
-            product_data: { name: title },
-            unit_amount: unitAmount,
-          },
-          quantity: 1,
-        },
-      ],
-      // Guardamos el ID del pedido de forma invisible para recuperarlo en el webhook.
-      metadata: { orderId },
+      line_items: lineItems,
+      // Ids de los pedidos, invisibles para el cliente, para recuperarlos en el
+      // webhook. `orderId` (el principal) se mantiene por compatibilidad.
+      metadata: {
+        orderId: group.leadOrderId,
+        ...(single ? {} : { orderIds: group.orderIds.join(',') }),
+      },
       success_url: `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${frontendUrl}/checkout`,
     });
@@ -151,17 +130,19 @@ export class StripeService {
       event = this.stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
     } catch (err: any) {
       console.error(`⚠️ Webhook signature verification failed.`, err.message);
-      throw new HttpException(`Webhook Error: ${err.message}`, HttpStatus.BAD_REQUEST);
+      throw new HttpException(`Webhook Error: ${err.message}`, 400);
     }
 
     // Si el usuario pagó exitosamente
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session;
 
-      // Recuperamos el ID oculto del pedido
-      const orderId = session.metadata?.orderId;
+      // Recuperamos los IDs ocultos de los pedidos (uno, o varios si fue un carrito).
+      const orderIds = orderIdsFromMetadata(session.metadata);
+      const leadOrderId = orderIds[0];
+      const now = new Date().toISOString();
 
-      if (orderId) {
+      for (const orderId of orderIds) {
         try {
           const orderRef = getFirestore().collection('orders').doc(orderId);
           const orderSnapshot = await orderRef.get();
@@ -169,10 +150,14 @@ export class StripeService {
           // Actualizamos la base de datos DIRECTAMENTE desde el servidor
           await orderRef.update({
             status: 'paid',
-            updatedAt: new Date().toISOString(),
+            updatedAt: now,
           });
 
           console.log(`✅ ¡Éxito! Pedido ${orderId} actualizado a 'paid' vía Webhook.`);
+
+          // En un carrito es una sola compra: el correo de confirmación y el
+          // canje del código van solo con el pedido principal.
+          if (orderId !== leadOrderId) continue;
 
           // Correo de confirmación de compra (si el dueño lo activó). notify() no
           // lanza y es idempotente: los reintentos de Stripe no lo duplican.

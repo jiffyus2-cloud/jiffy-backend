@@ -45,6 +45,12 @@ describe('orderEmailContext', () => {
     assert.equal(orderEmailContext('x', {}, { email: 'u@m.co', name: 'U' }, 'https://a.co').email, 'u@m.co');
     assert.equal(orderEmailContext('x', {}, undefined, 'https://a.co').product, 'tu álbum');
   });
+
+  it('una compra de varios productos se nombra por su número de productos', () => {
+    const order = { product: { name: 'Álbum' }, checkoutGroup: { id: 'g', orderIds: ['x', 'y', 'z'] } };
+    assert.equal(orderEmailContext('x', order, undefined, 'https://a.co').product, '3 productos');
+    assert.equal(orderEmailContext('x', { ...order, checkoutGroup: { id: 'g', orderIds: ['x'] } }, undefined, 'https://a.co').product, 'Álbum');
+  });
 });
 
 describe('fillOrderVariables + renderEmail', () => {
