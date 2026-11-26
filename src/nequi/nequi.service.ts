@@ -3,6 +3,7 @@ import { getFirestore } from '../firebase/firebase-admin';
 import { DiscountsService } from '../discounts/discounts.service';
 import { OrderEmailService } from '../email/order-email.service';
 import { readNequiConfig } from './nequi.config';
+import { CheckoutGroupError, NON_PAYABLE_STATUSES, validateGroup } from '../stripe/checkout-group';
 import {
   NequiApiError,
   NequiClient,
@@ -14,13 +15,9 @@ import {
 } from './nequi.client';
 
 /**
- * Estados en los que un pedido NO se puede volver a cobrar. La misma lista
- * negra que usa StripeService, por el mismo motivo (ver allí).
- */
-const NON_PAYABLE_STATUSES = new Set(['paid', 'mock_paid', 'en_produccion', 'enviado', 'entregado']);
-
-/**
- * El cobro vive en `nequi_payments/{orderId}` y NO dentro del pedido.
+ * El cobro vive en `nequi_payments/{orderId}` y NO dentro del pedido. En una
+ * compra de varios productos (carrito) el id es el del pedido principal y el
+ * registro lista en `orderIds` todos los pedidos que cubre.
  *
  * firestore.rules deja que el cliente edite su propio pedido; si el
  * transactionId estuviera ahí, alguien podría pegar el id de un cobro ya pagado
@@ -35,6 +32,8 @@ const PAYMENTS = 'nequi_payments';
 
 export interface NequiPaymentRecord {
   orderId: string;
+  /** Compra de varios productos: todos los pedidos que cubre (el primero es `orderId`). */
+  orderIds?: string[];
   userId: string;
   transactionId: string;
   /**
@@ -100,35 +99,37 @@ export class NequiService {
    * antes de mandar otro, para que el cliente no tenga dos notificaciones
    * abiertas y acabe pagando dos veces.
    */
-  async createPayment(params: { orderId: string; uid: string; phone: unknown }): Promise<NequiPaymentView> {
+  async createPayment(params: { orderIds: string[]; uid: string; phone: unknown }): Promise<NequiPaymentView> {
     this.assertConfigured();
     const phoneNumber = normalizeNequiPhone(params.phone);
     if (!phoneNumber) {
       throw new HttpException('El celular de Nequi debe tener 10 dígitos y empezar por 3.', HttpStatus.BAD_REQUEST);
     }
 
-    const { order } = await this.loadOwnOrder(params.orderId, params.uid);
-
-    if (NON_PAYABLE_STATUSES.has(order.status)) {
-      throw new HttpException(
-        `El pedido ya está en estado "${order.status}" y no admite un nuevo pago`,
-        HttpStatus.CONFLICT,
-      );
+    // Uno o varios pedidos (carrito): mismas comprobaciones que Stripe. El
+    // cobro se guarda con el id del pedido principal (el primero).
+    const db = getFirestore();
+    const snaps = await Promise.all(params.orderIds.map(id => db.collection('orders').doc(id).get()));
+    let group: ReturnType<typeof validateGroup>;
+    try {
+      group = validateGroup(params.orderIds, snaps.map(s => (s.exists ? s.data() : null)), params.uid);
+    } catch (err) {
+      if (err instanceof CheckoutGroupError) {
+        if (err.status === 403) {
+          this.logger.warn(`Usuario ${params.uid} intentó pagar pedidos ajenos: ${params.orderIds.join(', ')}.`);
+        }
+        throw new HttpException(err.message, err.status);
+      }
+      throw err;
     }
-
-    const total = Math.round(Number(order.total));
-    if (!Number.isFinite(total) || total <= 0) {
-      throw new HttpException(
-        'El pedido no tiene un total válido. Vuelve al checkout y confirma la dirección.',
-        HttpStatus.BAD_REQUEST,
-      );
-    }
+    const orderId = group.leadOrderId;
+    const total = Math.round(group.totalMinor / 100);
 
     // ¿Había un cobro anterior? Primero saber si ya se pagó; si sigue
     // pendiente, anularlo antes de mandar el nuevo.
-    const previous = await this.loadRecord(params.orderId);
+    const previous = await this.loadRecord(orderId);
     if (previous?.state === 'pending') {
-      const refreshed = await this.refresh(params.orderId, true);
+      const refreshed = await this.refresh(orderId, true);
       if (refreshed.state === 'paid') return refreshed;
       if (refreshed.state === 'pending') {
         try {
@@ -139,10 +140,10 @@ export class NequiService {
         } catch (err) {
           // Si no se pudo anular puede ser porque el cliente lo acaba de
           // aceptar: una última consulta antes de decidir.
-          const last = await this.refresh(params.orderId, true);
+          const last = await this.refresh(orderId, true);
           if (last.state === 'paid') return last;
           if (last.state === 'pending') {
-            this.logger.warn(`No se pudo anular el cobro previo del pedido ${params.orderId}: ${describe(err)}`);
+            this.logger.warn(`No se pudo anular el cobro previo del pedido ${orderId}: ${describe(err)}`);
             throw new HttpException(
               'Tienes un cobro de Nequi pendiente para este pedido. Acéptalo o recházalo en tu app, o espera unos minutos.',
               HttpStatus.CONFLICT,
@@ -160,7 +161,7 @@ export class NequiService {
       ({ transactionId } = await this.client.sendPushPayment({
         phoneNumber,
         value: total,
-        reference1: params.orderId,
+        reference1: orderId,
         reference2: 'Jiffy Photos',
         messageId,
       }));
@@ -171,10 +172,10 @@ export class NequiService {
         // reversarlo para que no quede un pago huérfano.
         try {
           await this.client.reverseTransaction({ phoneNumber, value: total, messageId });
-          this.logger.warn(`Cobro sin respuesta del pedido ${params.orderId} reversado (MessageID ${messageId}).`);
+          this.logger.warn(`Cobro sin respuesta del pedido ${orderId} reversado (MessageID ${messageId}).`);
         } catch (revErr) {
           this.logger.error(
-            `⚠️ Cobro sin respuesta del pedido ${params.orderId} y la reversión falló ` +
+            `⚠️ Cobro sin respuesta del pedido ${orderId} y la reversión falló ` +
             `(MessageID ${messageId}, celular ${maskPhone(phoneNumber)}, ${total} COP): ${describe(revErr)}. Revisar a mano.`,
           );
         }
@@ -184,7 +185,7 @@ export class NequiService {
 
     const now = new Date().toISOString();
     const record: NequiPaymentRecord = {
-      orderId: params.orderId,
+      orderId: orderId,
       userId: params.uid,
       transactionId,
       messageId,
@@ -195,17 +196,20 @@ export class NequiService {
       createdAt: now,
       updatedAt: now,
       checkedAt: null,
+      ...(group.orderIds.length > 1 ? { orderIds: group.orderIds } : {}),
     };
-    const db = getFirestore();
-    await db.collection(PAYMENTS).doc(params.orderId).set(record);
-    await db.collection('orders').doc(params.orderId).update({
-      paymentMethod: 'nequi',
-      nequiState: 'pending',
-      updatedAt: now,
-    });
-    this.logger.log(`Cobro push enviado: pedido ${params.orderId}, ${total} COP, tx ${transactionId}.`);
+    await db.collection(PAYMENTS).doc(orderId).set(record);
+    const batch = db.batch();
+    for (const id of group.orderIds) {
+      batch.update(db.collection('orders').doc(id), { paymentMethod: 'nequi', nequiState: 'pending', updatedAt: now });
+    }
+    await batch.commit();
+    this.logger.log(
+      `Cobro push enviado: pedido ${orderId}${group.orderIds.length > 1 ? ` (+${group.orderIds.length - 1} de la compra)` : ''}, ` +
+      `${total} COP, tx ${transactionId}.`,
+    );
 
-    return toView(record, order.status);
+    return toView(record, (snaps[0].data() as any)?.status);
   }
 
   /** Estado del cobro del pedido (consulta a Nequi si sigue pendiente). */
@@ -254,19 +258,32 @@ export class NequiService {
       throw new HttpException('Falta orderId', HttpStatus.BAD_REQUEST);
     }
     const db = getFirestore();
-    const orderRef = db.collection('orders').doc(orderId);
-    const [orderSnap, rec] = await Promise.all([orderRef.get(), this.loadRecord(orderId)]);
+    const orderSnap = await db.collection('orders').doc(orderId).get();
     if (!orderSnap.exists) throw new HttpException('El pedido no existe', HttpStatus.NOT_FOUND);
     const order = orderSnap.data() as any;
 
-    if (!rec) throw new HttpException('Este pedido no se pagó con Nequi', HttpStatus.NOT_FOUND);
+    // En una compra de varios productos el cobro vive con el pedido principal:
+    // la devolución se puede pedir desde cualquiera de ellos y los cubre a todos.
+    const payKey = nequiRecordKey(orderId, order);
+    const rec = await this.loadRecord(payKey);
+    if (!rec || !recordOrderIds(rec).includes(orderId)) {
+      throw new HttpException('Este pedido no se pagó con Nequi', HttpStatus.NOT_FOUND);
+    }
     if (rec.state === 'reversed') return toView(rec, order.status);
     if (rec.state !== 'paid') {
       throw new HttpException(`El cobro de Nequi está "${rec.state}", no "paid": no hay nada que reversar.`, HttpStatus.CONFLICT);
     }
-    if (order.status !== 'paid') {
+
+    const ids = recordOrderIds(rec);
+    const refs = ids.map(id => db.collection('orders').doc(id));
+    const all = await Promise.all(refs.map(r => r.get()));
+    const notPaid = ids.filter((_, i) => (all[i].data() as any)?.status !== 'paid');
+    if (notPaid.length > 0) {
       throw new HttpException(
-        `El pedido está en "${order.status}". Solo se reversan pedidos en "Pagado".`,
+        ids.length > 1
+          ? `La devolución cubre los ${ids.length} pedidos de la compra y no todos están en "Pagado" ` +
+            `(${notPaid.map(id => `#${id.slice(0, 8)}`).join(', ')}). Solo se reversan compras con todos sus pedidos en "Pagado".`
+          : `El pedido está en "${order.status}". Solo se reversan pedidos en "Pagado".`,
         HttpStatus.CONFLICT,
       );
     }
@@ -285,25 +302,30 @@ export class NequiService {
 
     const now = new Date().toISOString();
     await db.runTransaction(async tx => {
-      const fresh = (await tx.get(orderRef)).data() as any;
-      tx.update(db.collection(PAYMENTS).doc(orderId), {
+      const fresh = await Promise.all(refs.map(r => tx.get(r)));
+      tx.update(db.collection(PAYMENTS).doc(payKey), {
         state: 'reversed',
         reversedAt: now,
         reversedBy: params.ownerEmail,
         updatedAt: now,
       });
-      tx.update(orderRef, {
-        // Si mientras tanto alguien lo movió de "paid", no se le cambia el estado.
-        ...(fresh?.status === 'paid' ? { status: 'pending_payment' } : {}),
-        nequiState: 'reversed',
-        updatedAt: now,
+      refs.forEach((ref, i) => {
+        tx.update(ref, {
+          // Si mientras tanto alguien lo movió de "paid", no se le cambia el estado.
+          ...((fresh[i].data() as any)?.status === 'paid' ? { status: 'pending_payment' } : {}),
+          nequiState: 'reversed',
+          updatedAt: now,
+        });
       });
     });
-    this.logger.log(`↩️ Pago Nequi del pedido ${orderId} reversado por ${params.ownerEmail} (${rec.value} COP).`);
+    this.logger.log(
+      `↩️ Pago Nequi de ${ids.length > 1 ? `la compra ${ids.join(', ')}` : `el pedido ${payKey}`} ` +
+      `reversado por ${params.ownerEmail} (${rec.value} COP).`,
+    );
     return toView({ ...rec, state: 'reversed', updatedAt: now }, 'pending_payment');
   }
 
-  /**
+/**
    * Revisa todos los cobros pendientes. Lo llama Cloud Scheduler para cerrar
    * los pedidos cuyo cliente pagó y cerró la pestaña antes de que el navegador
    * lo viera.
@@ -373,10 +395,11 @@ export class NequiService {
 
     // Transacción: dos consultas simultáneas (navegador + reconciliación) no
     // deben marcar el pedido dos veces ni contar dos canjes.
+    // Todos los pedidos que cubre el cobro (varios si fue una compra de carrito).
+    const orderRefs = recordOrderIds(rec).map(id => db.collection('orders').doc(id));
     const firstTime = await db.runTransaction(async tx => {
-      const [freshPay, freshOrder] = await Promise.all([tx.get(payRef), tx.get(orderRef)]);
+      const [freshPay, ...freshOrders] = await Promise.all([tx.get(payRef), ...orderRefs.map(r => tx.get(r))]);
       if ((freshPay.data() as any)?.state === 'paid') return false;
-      const currentStatus = (freshOrder.data() as any)?.status;
       tx.update(payRef, {
         state: 'paid',
         rawStatus: result.rawStatus,
@@ -385,18 +408,25 @@ export class NequiService {
         checkedAt: now,
         updatedAt: now,
       });
-      tx.update(orderRef, {
-        // Si el dueño ya lo pasó a producción no se le retrocede el estado.
-        status: NON_PAYABLE_STATUSES.has(currentStatus) ? currentStatus : 'paid',
-        paymentMethod: 'nequi',
-        nequiState: 'paid',
-        updatedAt: now,
+      orderRefs.forEach((ref, i) => {
+        const currentStatus = (freshOrders[i].data() as any)?.status;
+        tx.update(ref, {
+          // Si el dueño ya lo pasó a producción no se le retrocede el estado.
+          status: NON_PAYABLE_STATUSES.has(currentStatus) ? currentStatus : 'paid',
+          paymentMethod: 'nequi',
+          nequiState: 'paid',
+          updatedAt: now,
+        });
       });
       return true;
     });
 
     if (firstTime) {
-      this.logger.log(`✅ Pedido ${orderId} pagado con Nequi (tx ${rec.transactionId}).`);
+      this.logger.log(
+        `✅ Pedido ${orderId}${orderRefs.length > 1 ? ` y los otros ${orderRefs.length - 1} de su compra` : ''} ` +
+        `pagado con Nequi (tx ${rec.transactionId}).`,
+      );
+      // En una compra de varios productos, correo y canje van solo con el principal.
       // Correo de confirmación de compra (si está activado; notify() no lanza).
       await this.orderEmails.notify(orderId, 'paid');
       // Igual que en el webhook de Stripe: el canje se cuenta al confirmar el
@@ -418,8 +448,13 @@ export class NequiService {
 
   private async closeRecord(orderId: string, state: NequiPaymentState, rawStatus: string | null, now: string) {
     const db = getFirestore();
+    const rec = await this.loadRecord(orderId);
     await db.collection(PAYMENTS).doc(orderId).update({ state, rawStatus, checkedAt: now, updatedAt: now });
-    await db.collection('orders').doc(orderId).update({ nequiState: state, updatedAt: now });
+    const batch = db.batch();
+    for (const id of rec ? recordOrderIds(rec) : [orderId]) {
+      batch.update(db.collection('orders').doc(id), { nequiState: state, updatedAt: now });
+    }
+    await batch.commit();
   }
 
   private async loadRecord(orderId: string): Promise<NequiPaymentRecord | null> {
@@ -465,6 +500,21 @@ export class NequiService {
     this.logger.error(`${fallback} ${describe(err)}`);
     return new HttpException(`${fallback} Inténtalo de nuevo en unos minutos.`, HttpStatus.BAD_GATEWAY);
   }
+}
+
+/** Pedidos que cubre un cobro: los de la compra, o solo el suyo (registros de un pedido). */
+export function recordOrderIds(rec: Pick<NequiPaymentRecord, 'orderId' | 'orderIds'>): string[] {
+  return Array.isArray(rec.orderIds) && rec.orderIds.length > 0 ? rec.orderIds : [rec.orderId];
+}
+
+/**
+ * Dónde buscar el cobro de un pedido: en una compra de varios productos, con el
+ * pedido principal. `checkoutGroup` lo escribe el cliente, así que es solo una
+ * pista: quien la usa debe comprobar que el registro incluye el pedido.
+ */
+export function nequiRecordKey(orderId: string, order: Record<string, any> | null | undefined): string {
+  const lead = order?.checkoutGroup?.leadOrderId;
+  return typeof lead === 'string' && lead.trim() !== '' && !lead.includes('/') ? lead : orderId;
 }
 
 export function maskPhone(phone: string): string {
