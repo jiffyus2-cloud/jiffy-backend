@@ -89,7 +89,11 @@ export function orderEmailContext(
 ): OrderEmailContext {
   const email = String(order.shippingAddress?.email || order.customerEmail || user?.email || '').trim().toLowerCase();
   const name = String(order.shippingAddress?.name || order.customerName || user?.name || '').trim();
-  const product = String(order.product?.name || order.productName || order.productType || 'tu álbum').trim();
+  // Compra de varios productos (carrito): el correo es de la compra entera.
+  const groupSize = Array.isArray(order.checkoutGroup?.orderIds) ? order.checkoutGroup.orderIds.length : 0;
+  const product = groupSize > 1
+    ? `${groupSize} productos`
+    : String(order.product?.name || order.productName || order.productType || 'tu álbum').trim();
   return {
     email,
     name,
